@@ -13,11 +13,48 @@
 #import <objc/runtime.h>
 #import <unistd.h>
 #import <sys/time.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
+#import <string.h>
+#import <errno.h>
+#import <fcntl.h>
 
 static int gFD = -1;
 static NSString *gPath = nil;
 static NSLock *gLock = nil;
+static id gInitLock = nil;
 static NSMutableArray<NSString *> *gRecent = nil;   // ring buffer for the dump
+
+// Sentinel object so plain C functions have something stable for @synchronized.
+@interface QMDiagSentinel : NSObject
++ (instancetype)shared;
+@end
+
+@implementation QMDiagSentinel
++ (instancetype)shared {
+    static QMDiagSentinel *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [QMDiagSentinel new]; });
+    return s;
+}
+@end
+
+// dlsym rather than direct linkage: the dyld introspection symbols are not part
+// of the public SDK on every deployment target the tweak supports, and a direct
+// call fails to link on older ones.
+static int QMDyldImageCount(void) {
+    static int (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ fn = (int (*)(void))dlsym(RTLD_DEFAULT, "_dyld_image_count"); });
+    return fn ? fn() : 0;
+}
+
+static const char *QMDyldImageName(int i) {
+    static const char *(*fn)(int);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ fn = (const char *(*)(int))dlsym(RTLD_DEFAULT, "_dyld_get_image_name"); });
+    return fn ? fn(i) : NULL;
+}
 
 static NSString *QMDiagPickPath(void) {
     NSArray<NSString *> *candidates = @[
@@ -40,14 +77,16 @@ static NSString *QMDiagPickPath(void) {
 }
 
 NSString *QMDiagPath(void) {
-    @synchronized([QMDiag class]) {
+    // @synchronized needs an object; a plain function has no reliable self, so
+    // a dedicated sentinel guards initialisation instead.
+    @synchronized([QMDiagSentinel shared]) {
         if (!gPath) gPath = QMDiagPickPath();
         return gPath;
     }
 }
 
 void QMDiagOpen(void) {
-    @synchronized([QMDiag class]) {
+    @synchronized([QMDiagSentinel shared]) {
         if (gLock) return;
         gLock = [NSLock new];
         gRecent = [NSMutableArray arrayWithCapacity:64];
@@ -169,9 +208,9 @@ void QMDiagDumpEnvironment(void) {
               [[NSFileManager defaultManager] fileExistsAtPath:@"/usr/lib/libsubstrate.dylib"]);
 
     QMDiagLog(@"---- load order ----");
-    int n = _dyld_image_count();
+    int n = QMDyldImageCount();
     for (int i = 0; i < n; i++) {
-        const char *name = _dyld_get_image_name(i);
+        const char *name = QMDyldImageName(i);
         if (!name) continue;
         if (strstr(name, "PxExt") || strstr(name, "QoSMetrics") ||
             strstr(name, "DeltaForce") || strstr(name, "substrate")) {
@@ -189,9 +228,15 @@ void QMDiagDumpEnvironment(void) {
             QMDiagLog(@"  %-18s ABSENT", names[i]);
             continue;
         }
-        QMDiagLog(@"  %-18s %p  super=%@  methods=%u",
-                  names[i], (void *)c, class_getSuperclass(c),
-                  (unsigned)0);
+        Class sup = class_getSuperclass(c);
+        unsigned mc = 0;
+        unsigned imc = 0;
+        Method *ml = class_copyMethodList(c, &mc);
+        if (ml) free(ml);
+        Method *iml = class_copyMethodList(object_getClass(c), &imc);
+        if (iml) free(iml);
+        QMDiagLog(@"  %-18s %p super=%s methods=%u classmethods=%u",
+                  names[i], (void *)c, sup ? class_getName(sup) : "nil", mc, imc);
     }
 }
 
