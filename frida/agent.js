@@ -134,10 +134,10 @@ function call(obj, sel, args) {
 
 /* ------------------------------------------------------------- success path */
 
-function grant(client) {
-  if (!client || client.isNull()) { log('GRANT aborted: client nil'); return; }
-  log('GRANT begin');
-  dumpState(client);
+/* State only — no UI. The framework's own guards read these, so applying them
+ * before the original code runs is what makes it take the licensed branch. */
+function applyState(client) {
+  if (!client || client.isNull()) return;
   call(client, 'setHasValidatedSession:', [1]);
   call(client, 'setAuthWallRequired:', [0]);
   call(client, 'setValidating:', [0]);
@@ -147,25 +147,60 @@ function grant(client) {
   call(client, 'setLastSubmittedKey:', [str(KEY)]);
   call(client, 'setExpiryDate:',
        [ObjC.classes.NSDate.dateWithTimeIntervalSince1970_(EXPIRES_TS)]);
-  // handleResponse: also sets these. MenuView/ModSkinView/ESPOverlayView read
-  // packagePayload for every feature key (slot0_weapon, melee_skin, ...) — nil
-  // there unlocks the shell but renders an empty menu.
   call(client, 'setPaidChallenge:', [str(TOKEN)]);
   call(client, 'setDevicePayload:', [ObjC.classes.NSDictionary.dictionary()]);
   call(client, 'setPackagePayload:', [ObjC.classes.NSDictionary.dictionary()]);
   call(client, 'setLastFailCode:', [NULL]);
+}
+
+/* The menu/overlay tree belongs to -[UIManager setupUI]. Forcing it a second
+ * time builds a duplicate and orphans the first, so only call it when the tree
+ * is genuinely missing; re-attach a button built before the window existed. */
+function ensureUI() {
+  const mgrCls = ObjC.classes.UIManager;
+  if (!mgrCls) { log('UI: UIManager absent'); return; }
+  const mgr = safe(() => mgrCls.shared(), null);
+  if (!mgr || mgr.isNull()) { log('UI: shared nil'); return; }
+
+  let menu = call(mgr, 'menu', []);
+  let tpp = call(mgr, 'tppButton', []);
+  log('UI: before menu=' + describe(menu) + ' tpp=' + describe(tpp));
+
+  if ((!menu || menu.isNull()) && (!tpp || tpp.isNull())) {
+    log('UI: menu missing -> forcing setupUI');
+    call(mgr, 'setupUI', []);
+    call(mgr, 'showTPPButton:', [1]);
+    menu = call(mgr, 'menu', []);
+    tpp = call(mgr, 'tppButton', []);
+    log('UI: after setupUI menu=' + describe(menu) + ' tpp=' + describe(tpp));
+  }
+
+  if (tpp && !tpp.isNull()) {
+    const win = safe(() => tpp.window(), null);
+    if (!win || win.isNull()) {
+      const keyWin = safe(() => ObjC.classes.UIApplication.sharedApplication()
+        .keyWindow(), null);
+      log('UI: tpp has no window, keyWindow=' + describe(keyWin));
+      if (keyWin && !keyWin.isNull()) safe(() => keyWin.addSubview_(tpp));
+    } else {
+      log('UI: tpp attached hidden=' + safe(() => tpp.hidden(), '?') +
+          ' alpha=' + safe(() => tpp.alpha(), '?'));
+    }
+  }
+}
+
+function grant(client) {
+  if (!client || client.isNull()) { log('GRANT aborted: client nil'); return; }
+  log('GRANT begin');
+  dumpState(client);
+  applyState(client);
   call(client, 'runPendingBlocks', []);
 
   const hud = call(client, 'hud', []);
   call(hud, 'hideLoading', []);
   call(hud, 'hideBlockingWait', []);
 
-  const mgrCls = ObjC.classes.UIManager;
-  if (mgrCls) {
-    const mgr = safe(() => mgrCls.shared(), null);
-    call(mgr, 'setupUI', []);
-    call(mgr, 'showTPPButton:', [1]);
-  }
+  ensureUI();
 
   const cb = call(client, 'onLoginSuccess', []);
   if (cb && !cb.isNull()) {
@@ -268,11 +303,35 @@ function install() {
   hook(SKClient, '-', 'continueAfterUDID', function (self) { grantAsync(self); });
 
   // Keep the original: it owns the overlay/window plumbing the HUD renders into.
-  // Its network and UDID calls are already inert by the time it runs.
+  // State goes in first — -start reads it through -uiAllowed and bails out of
+  // the licensed branch when it is not set, which is how the menu disappears.
   hook(SKClient, '-', 'start', function (self, orig) {
+    log('start -> applying state, then original');
+    safe(() => applyState(self));
     safe(() => orig());
     grantAsync(self);
   });
+
+  /* -uiAllowed is the single question the framework asks before showing
+   * anything, and -hideUI is the flag it consults. */
+  hook(SKClient, '-', 'uiAllowed', function (self, orig) {
+    const real = safe(() => orig(), 0);
+    log('uiAllowed -> YES (real=' + real + ')');
+    return 1;
+  });
+  hook(SKClient, '-', 'hideUI', function (self, orig) {
+    const real = safe(() => orig(), 0);
+    log('hideUI -> NO (real=' + real + ')');
+    return 0;
+  });
+
+  /* Teardown removes the menu tree. The env scanner and the revocation tick
+   * both route here; a menu that vanishes seconds after appearing is the
+   * visible symptom. */
+  const UIManager = ObjC.classes.UIManager;
+  if (UIManager) {
+    hook(UIManager, '-', 'teardownUI', function () { log('teardownUI blocked'); });
+  }
 
   hook(SKClient, '-', 'fail:code:silent:', function (self, orig, a, code, silent) {
     log('fail swallowed ' + (code && !code.isNull() ? code.toString() : '?'));
@@ -299,7 +358,7 @@ function install() {
   dumpEnvironment();
 
   const shared = safe(() => SKClient.shared(), null);
-  if (shared && !shared.isNull()) grant(shared);
+  if (shared && !shared.isNull()) applyState(shared);
 }
 
 /* PxExtFFi may not be mapped yet at attach time: poll, bounded. */

@@ -118,3 +118,25 @@ Five real defects found by re-reading the disassembly, all fixed:
 Verified mechanically after the fixes: 47/47 hooks, 47/47 trampolines, class-vs-instance
 placement checked against `__objc_methtype`/`__objc_methlist`, 22/22 `@selector()`
 targets resolved.
+
+## Changes after the menu-loss report
+
+Symptom: the gate passed but the in-game menu never appeared / vanished. Three causes,
+all in the ordering of the grant, not in the gate itself:
+
+6. **`-start` was called before the state was applied.** `-start` reads
+   `hasValidatedSession` and `hideUI` through `-uiAllowed` and takes an early-out branch
+   when the client is not licensed — so calling `orig` first meant the licenced branch
+   (the one that builds the UI) never ran, no matter what the grant set afterwards. The
+   state is now applied first; `orig` then runs down its own licensed path.
+7. **`setupUI` was forced on every grant.** `-[UIManager setupUI]` builds the menu and
+   the floating button. A second call builds a duplicate tree and orphans the first; a
+   call made before the key window exists attaches the button to nothing. It is now only
+   forced when `menu` and `tppButton` are both nil, and an existing button that has no
+   window is re-attached instead of rebuilt.
+8. **`-teardownUI` was reachable.** The environment scanner and the revocation tick both
+   route into it, which is exactly how a menu disappears seconds after it appears. It is
+   hooked and blocked, alongside `-uiAllowed` (forced `YES`) and `-hideUI` (forced `NO`).
+
+Verified after these: 51/51 hooks placed, 51/51 trampolines declared and used, brace and
+paren balance clean.

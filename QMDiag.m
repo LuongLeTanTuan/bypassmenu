@@ -236,7 +236,7 @@ void QMDiagDumpEnvironment(void) {
         Method *iml = class_copyMethodList(object_getClass(c), &imc);
         if (iml) free(iml);
         QMDiagLog(@"  %-18s %p super=%s methods=%u classmethods=%u",
-                  names[i], (void *)c, sup ? class_getName(sup) : "nil", mc, imc);
+                  names[i], (__bridge void *)c, sup ? class_getName(sup) : "nil", mc, imc);
     }
 }
 
@@ -259,7 +259,8 @@ void QMDiagDumpState(id client) {
         QMDiagLog(@"  %-18s = %@", sels[i], QMDescribe(v));
     }
     const char *bools[] = { "hasValidatedSession", "authWallRequired", "validating",
-                            "silentRevalidating", "successCardShown", "hideUI" };
+                            "silentRevalidating", "successCardShown", "hideUI",
+                            "uiAllowed" };
     for (size_t i = 0; i < sizeof(bools) / sizeof(bools[0]); i++) {
         SEL s = sel_registerName(bools[i]);
         BOOL v = NO;

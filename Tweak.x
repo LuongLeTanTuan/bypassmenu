@@ -75,13 +75,12 @@ static NSDictionary *QMPackagePayload(void) {
     return payload;
 }
 
-static void QMGrant(id client, BOOL showCard) {
-    if (!client) {
-        LOG(@"GRANT aborted: client is nil");
-        return;
-    }
-    LOG(@"GRANT begin showCard=%d", (int)showCard);
-    QMDiagDumpState(client);
+// Licensing state only — no UI, no dispatch. Every flag the framework's own
+// guards read is set here, so a later call into the original code takes the
+// already-validated branch instead of bailing out. Safe to call on any thread
+// the framework itself would use: it only sends setters.
+static void QMApplyState(id client) {
+    if (!client) return;
 
     QMSendB(client, @selector(setHasValidatedSession:), YES);
     QMSendB(client, @selector(setAuthWallRequired:), NO);
@@ -96,6 +95,70 @@ static void QMGrant(id client, BOOL showCard) {
     QMSendO(client, @selector(setDevicePayload:), @{});
     QMSendO(client, @selector(setPackagePayload:), QMPackagePayload());
     QMSendO(client, @selector(setLastFailCode:), nil);
+}
+
+static UIWindow *QMKeyWindow(void) {
+    UIWindow *w = nil;
+    for (UIScene *s in [[UIApplication sharedApplication] connectedScenes]) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *cand in ((UIWindowScene *)s).windows) {
+            if (cand.isKeyWindow) return cand;
+        }
+    }
+    return w;
+}
+
+// The menu and the floating button are built by -[UIManager setupUI]. The
+// framework calls it once it considers the client licensed; calling it a second
+// time builds a duplicate tree and orphans the first, which is why the earlier
+// version could leave no visible menu at all. Force it only when the tree is
+// genuinely missing, and re-attach a button that was built before the key
+// window existed — a view with no window is invisible.
+static void QMEnsureUI(void) {
+    Class mgr = NSClassFromString(@"UIManager");
+    if (!mgr) { LOG(@"UI: UIManager absent"); return; }
+
+    id shared = QMSend0((id)mgr, @selector(shared));
+    if (!shared) { LOG(@"UI: UIManager.shared nil"); return; }
+
+    id menu = QMSend0(shared, @selector(menu));
+    id tpp = QMSend0(shared, @selector(tppButton));
+    LOG(@"UI: before menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
+
+    if (!menu && !tpp) {
+        LOG(@"UI: menu missing -> forcing setupUI");
+        QMSendV(shared, @selector(setupUI));
+        QMSendB(shared, @selector(showTPPButton:), YES);
+        menu = QMSend0(shared, @selector(menu));
+        tpp = QMSend0(shared, @selector(tppButton));
+        LOG(@"UI: after setupUI menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
+    }
+
+    if (tpp && [tpp isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)tpp;
+        if (!v.window) {
+            UIWindow *win = QMKeyWindow();
+            LOG(@"UI: tpp has no window (keyWindow=%p) -> re-attaching", (__bridge void *)win);
+            if (win) [win addSubview:v];
+        } else {
+            LOG(@"UI: tpp in window, hidden=%d alpha=%.2f", (int)v.hidden, (double)v.alpha);
+        }
+    }
+
+    QMDiagLog(@"UI: final menu=%p tpp=%p",
+              (__bridge void *)QMSend0(shared, @selector(menu)),
+              (__bridge void *)QMSend0(shared, @selector(tppButton)));
+}
+
+static void QMGrant(id client, BOOL showCard) {
+    if (!client) {
+        LOG(@"GRANT aborted: client is nil");
+        return;
+    }
+    LOG(@"GRANT begin showCard=%d", (int)showCard);
+    QMDiagDumpState(client);
+
+    QMApplyState(client);
     QMSendV(client, @selector(runPendingBlocks));
 
     id hud = QMSend0(client, @selector(hud));
@@ -104,10 +167,7 @@ static void QMGrant(id client, BOOL showCard) {
 
     // Unlock the in-game surface first: the success card's ENTER GAME handler
     // tears the overlay down, so the button must already exist underneath it.
-    Class mgr = NSClassFromString(@"UIManager");
-    id shared = QMSend0((id)mgr, @selector(shared));
-    QMSendV(shared, @selector(setupUI));
-    QMSendB(shared, @selector(showTPPButton:), YES);
+    QMEnsureUI();
 
     if (showCard) {
         QMSendB(client, @selector(setSuccessCardShown:), YES);
@@ -311,6 +371,9 @@ static void (*origValidate)(id, SEL, id, BOOL);
 static void QMHookValidate(id self, SEL _cmd, id key, BOOL showUI) {
     LOG(@"HOOK validateWithKey: key=%@ showUI=%d", key ? key : @"(nil)", (int)showUI);
     QMSendO(self, @selector(setLastSubmittedKey:), key ?: kSyntheticKey);
+    // Apply before returning: anything that runs on the same turn already sees
+    // a licensed client instead of the pre-validation default.
+    QMApplyState(self);
     QMGrantAsync(self, showUI);
 }
 
@@ -328,14 +391,39 @@ static void QMHookContinueAfterUDID(id self, SEL _cmd) {
 
 static void (*origStart)(id, SEL);
 static void QMHookStart(id self, SEL _cmd) {
-    // -start reads udidValue/boundKey and calls -validateWithKey:showUI: when a
-    // key exists, otherwise opens the UDID guide. Our validateWithKey grants, so
-    // keep the original to let it drive its own flow; the extra grant covers the
-    // no-key branch where the original would have opened the capture UI.
-    LOG(@"HOOK start -> calling original");
+    // -start is the framework's own boot path. It reads hasValidatedSession /
+    // hideUI through -uiAllowed and bails out of everything when the client is
+    // not licensed, so the state has to be applied BEFORE the original runs —
+    // otherwise the original takes the unlicensed branch and the UI it would
+    // have built never appears.
+    LOG(@"HOOK start -> applying state, then original");
+    QMApplyState(self);
     if (origStart) origStart(self, _cmd);
     LOG(@"HOOK start -> original returned");
     QMGrantAsync(self, NO);
+}
+
+// -uiAllowed is the single question the framework asks before it shows anything.
+static BOOL (*origUIAllowed)(id, SEL);
+static BOOL QMHookUIAllowed(id self, SEL _cmd) {
+    BOOL real = origUIAllowed ? origUIAllowed(self, _cmd) : NO;
+    LOG(@"HOOK uiAllowed -> YES (real=%d)", (int)real);
+    return YES;
+}
+
+static BOOL (*origHideUI)(id, SEL);
+static BOOL QMHookHideUI(id self, SEL _cmd) {
+    BOOL real = origHideUI ? origHideUI(self, _cmd) : NO;
+    LOG(@"HOOK hideUI -> NO (real=%d)", (int)real);
+    return NO;
+}
+
+// Teardown removes the menu tree the framework just built. Hooking it is not
+// paranoia: the env scanner and the revocation tick both route here, and a
+// menu that vanishes seconds after appearing is the visible symptom.
+static void (*origTeardownUI)(id, SEL);
+static void QMHookTeardownUI(id self, SEL _cmd) {
+    LOG(@"HOOK teardownUI blocked");
 }
 
 static void (*origEnforceLock)(id, SEL);
@@ -528,10 +616,13 @@ static void QMInstallAll(void) {
         QMInstallIns(client, "isFatalCode:", (IMP)QMHookFatalCode, (IMP *)&origFatalCode);
         QMInstallIns(client, "isKeyErrorCode:", (IMP)QMHookKeyErrorCode, (IMP *)&origKeyErrorCode);
         QMInstallIns(client, "enforceLock", (IMP)QMHookEnforceLock, (IMP *)&origEnforceLock);
+        QMInstallIns(client, "uiAllowed", (IMP)QMHookUIAllowed, (IMP *)&origUIAllowed);
+        QMInstallIns(client, "hideUI", (IMP)QMHookHideUI, (IMP *)&origHideUI);
     }
 
     if (hud) {
-        QMInstallIns(hud, "showUDIDPrompt:guide:", (IMP)QMHookShowUDIDPrompt, (IMP *)&origShowUDIDPrompt);        QMInstallIns(hud, "showKeyPrompt:onSubmit:", (IMP)QMHookShowKeyPrompt, (IMP *)&origShowKeyPrompt);
+        QMInstallIns(hud, "showUDIDPrompt:guide:", (IMP)QMHookShowUDIDPrompt, (IMP *)&origShowUDIDPrompt);
+        QMInstallIns(hud, "showKeyPrompt:onSubmit:", (IMP)QMHookShowKeyPrompt, (IMP *)&origShowKeyPrompt);
         QMInstallIns(hud, "showFatalNotice:message:", (IMP)QMHookShowFatal, (IMP *)&origShowFatal);
         QMInstallIns(hud, "showNotice:message:", (IMP)QMHookShowNotice, (IMP *)&origShowNotice);
         QMInstallIns(hud, "showBlockingWait:message:actionTitle:onAction:", (IMP)QMHookShowBlocking, (IMP *)&origShowBlocking);
@@ -539,6 +630,14 @@ static void QMInstallAll(void) {
 
     LOG(@"INSTALL summary store=%d net=%d flow=%d client=%d hud=%d",
         store != nil, net != nil, flow != nil, client != nil, hud != nil);
+
+    // The menu/overlay tree belongs to the framework's own boot path. Forcing it
+    // here would build it before there is a window and orphan it, so only the
+    // licensing state is touched at install time.
+    Class uiMgr = NSClassFromString(@"UIManager");
+    if (uiMgr) {
+        QMInstallIns(uiMgr, "teardownUI", (IMP)QMHookTeardownUI, (IMP *)&origTeardownUI);
+    }
 
     // Diagnostic URL handler, read-only side effect on the log file.
     Class app = NSClassFromString(@"UIApplication");
@@ -552,7 +651,7 @@ static void QMInstallAll(void) {
 
     Class c = NSClassFromString(@"SKClient");
     id shared = QMSend0((id)c, @selector(shared));
-    if (shared) QMGrant(shared, NO);
+    if (shared) QMApplyState(shared);
 }
 
 #pragma mark - Late-bind driver
