@@ -170,7 +170,11 @@ static void QMEnsureUI(void) {
     id tpp = QMSend0(shared, @selector(tppButton));
     QMDiagLog(@"UI: pass menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
 
-    if (!menu && !tpp) {
+    // setupUI builds the whole tree from scratch; a second call stacks a second
+    // copy and orphans the first. Only ever force it once per process.
+    static BOOL forcedSetupUI = NO;
+    if (!menu && !tpp && !forcedSetupUI) {
+        forcedSetupUI = YES;
         QMDiagLog(@"UI: tree missing -> setupUI");
         QMSendV(shared, @selector(setupUI));
         menu = QMSend0(shared, @selector(menu));

@@ -197,6 +197,10 @@ function attachToWindow(v, win, hide) {
   log('UI: attached ' + v.$className);
 }
 
+/* setupUI builds the whole tree from scratch; a second call stacks a second
+ * copy and orphans the first. Only ever force it once per process. */
+let forcedSetupUI = false;
+
 function ensureUI() {
   const mgrCls = ObjC.classes.UIManager;
   if (!mgrCls) { log('UI: UIManager absent'); return; }
@@ -207,7 +211,8 @@ function ensureUI() {
   let tpp = call(mgr, 'tppButton', []);
   log('UI: pass menu=' + describe(menu) + ' tpp=' + describe(tpp));
 
-  if ((!menu || menu.isNull()) && (!tpp || tpp.isNull())) {
+  if ((!menu || menu.isNull()) && (!tpp || tpp.isNull()) && !forcedSetupUI) {
+    forcedSetupUI = true;
     log('UI: tree missing -> setupUI');
     call(mgr, 'setupUI', []);
     menu = call(mgr, 'menu', []);
