@@ -242,6 +242,30 @@ function ensureUI() {
   }
   if (menu && !menu.isNull()) attachToWindow(menu, win, true);
   if (esp && !esp.isNull()) attachToWindow(esp, win, true);
+
+  /* The mod-menu switch is a different class from the TPP camera switch the
+   * player already sees. -[UIManager setupUI] builds it (+buttonWithFrame:,
+   * then -setFloatingButton:), and wires its tap to -toggleMenu via setOnTap:.
+   * So it exists — it just never reaches the screen. */
+  const floatBtn = call(mgr, 'floatingButton', []);
+  logView('UI: floatingButton', floatBtn);
+  if (floatBtn && !floatBtn.isNull()) {
+    attachToWindow(floatBtn, win, false);
+    safe(() => floatBtn.setHidden_(0));
+    safe(() => floatBtn.setAlpha_(1));
+    safe(() => floatBtn.setUserInteractionEnabled_(1));
+    /* setupUI normally wires this; an absent onTap means the button is dead. */
+    const onTap = safe(() => floatBtn.onTap(), null);
+    if (!onTap || onTap.isNull()) {
+      log('UI: floatingButton onTap was nil -> wiring toggleMenu');
+      const blk = new ObjC.Block({
+        retType: 'void',
+        argTypes: [],
+        implementation: () => safe(() => mgr.toggleMenu())
+      });
+      safe(() => floatBtn.setOnTap_(blk));
+    }
+  }
 }
 
 /* The three blocks the host registers through the C API
@@ -478,11 +502,32 @@ const timer = setInterval(() => {
   }
 }, 250);
 
+/* -[UIManager toggleMenu] is what puts MenuView on screen: it does the
+ * addSubview:/removeFromSuperview itself, and it is what -[FloatingButton
+ * buttonTapped] reaches through its onTap block. */
+function showMenu() {
+  const mgrCls = ObjC.classes.UIManager;
+  if (!mgrCls) { log('MENU: UIManager absent'); return; }
+  const mgr = safe(() => mgrCls.shared(), null);
+  if (!mgr || mgr.isNull()) { log('MENU: shared nil'); return; }
+  if (!call(mgr, 'menu', [])) {
+    log('MENU: no MenuView yet -> setupUI first');
+    call(mgr, 'setupUI', []);
+  }
+  const menu = call(mgr, 'menu', []);
+  const win = keyWindow();
+  if (menu && !menu.isNull()) attachToWindow(menu, win, false);
+  log('MENU: toggleMenu');
+  call(mgr, 'toggleMenu', []);
+  logView('MENU: menu after toggle', call(mgr, 'menu', []));
+}
+
 /* Live diagnostics — type these in the Frida REPL once attached.
  *
  *   qos()        full state dump
  *   qosenv()     modules, load order, class presence
  *   qosgrant()   force a grant right now
+ *   qosmenu()    open/close the mod menu
  *   qoshelp()    this list
  */
 globalThis.qos = () => {
@@ -496,10 +541,12 @@ globalThis.qosgrant = () => {
   grant(c);
   return 'ok';
 };
+globalThis.qosmenu = () => { showMenu(); return 'ok'; };
 globalThis.qoshelp = () => {
   ['qos()      - dump SKClient state',
    'qosenv()   - dump modules / load order / classes',
    'qosgrant() - force grant now',
+   'qosmenu()  - open/close the mod menu',
    'qoshelp()  - this list'].forEach(log);
   return 'ok';
 };

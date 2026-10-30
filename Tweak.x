@@ -216,9 +216,66 @@ static void QMEnsureUI(void) {
     if ([menu isKindOfClass:[UIView class]]) QMAttachToWindow(menu, win, YES);
     if ([esp isKindOfClass:[UIView class]]) QMAttachToWindow(esp, win, YES);
 
-    QMDiagLog(@"UI: pass done menu=%p tpp=%p",
+    // The mod-menu switch is a different class from the TPP camera switch the
+    // player already sees. -[UIManager setupUI] builds it at +0x4478
+    // (+[FloatingButton buttonWithFrame:]), stores it at +0x449c
+    // (-setFloatingButton:), and wires its tap to -toggleMenu at +0x9040
+    // (-setOnTap:) / +0x203ec. So it exists — it just never reaches the screen.
+    id floatBtn = QMSend0(shared, @selector(floatingButton));
+    QMLogView(@"UI: floatingButton", floatBtn);
+    if ([floatBtn isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)floatBtn;
+        QMAttachToWindow(v, win, NO);
+        if (v.hidden) { v.hidden = NO; QMDiagLog(@"UI: floatingButton un-hidden"); }
+        if (v.alpha < 0.99) { v.alpha = 1.0; QMDiagLog(@"UI: floatingButton alpha restored"); }
+        v.userInteractionEnabled = YES;
+        if (CGRectIsEmpty(v.frame) && win)
+            v.frame = CGRectMake(16.0, 96.0, 56.0, 56.0);
+
+        // setupUI normally wires this; a nil onTap means the button is dead.
+        if ([floatBtn respondsToSelector:@selector(onTap)] &&
+            !QMSend0(floatBtn, @selector(onTap))) {
+            QMDiagLog(@"UI: floatingButton onTap was nil -> wiring toggleMenu");
+            void (^tap)(void) = ^{ QMSendV(shared, @selector(toggleMenu)); };
+            QMSendO(floatBtn, @selector(setOnTap:), tap);
+        }
+    }
+
+    QMDiagLog(@"UI: pass done menu=%p tpp=%p float=%p",
               (__bridge void *)QMSend0(shared, @selector(menu)),
-              (__bridge void *)QMSend0(shared, @selector(tppButton)));
+              (__bridge void *)QMSend0(shared, @selector(tppButton)),
+              (__bridge void *)QMSend0(shared, @selector(floatingButton)));
+}
+
+// -[UIManager toggleMenu] is the one thing that puts MenuView on screen: it
+// does the addSubview:/removeFromSuperview itself (verified at +0x2a78 and
+// +0x959c), and it is what -[FloatingButton buttonTapped] reaches through its
+// onTap block. Callable directly, so the menu can be opened without the button.
+static void QMShowMenu(void) {
+    Class mgr = NSClassFromString(@"UIManager");
+    if (!mgr) { QMDiagLog(@"MENU: UIManager absent"); return; }
+    id shared = QMSend0((id)mgr, @selector(shared));
+    if (!shared) { QMDiagLog(@"MENU: shared nil"); return; }
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ QMShowMenu(); });
+        return;
+    }
+
+    if (!QMSend0(shared, @selector(menu))) {
+        QMDiagLog(@"MENU: no MenuView yet -> setupUI first");
+        QMSendV(shared, @selector(setupUI));
+    }
+    id menu = QMSend0(shared, @selector(menu));
+    if ([menu isKindOfClass:[UIView class]]) {
+        UIWindow *win = QMKeyWindow();
+        if (win && !((UIView *)menu).window) {
+            [win addSubview:(UIView *)menu];
+            QMDiagLog(@"MENU: MenuView had no window -> attached");
+        }
+    }
+    QMDiagLog(@"MENU: toggleMenu");
+    QMSendV(shared, @selector(toggleMenu));
+    QMLogView(@"MENU: menu after toggle", QMSend0(shared, @selector(menu)));
 }
 
 // The grant can land before the key window exists (launch, orientation change,
@@ -663,6 +720,8 @@ static void QMHookShowBlocking(id self, SEL _cmd, id title, id msg, id action, i
 //
 //   qosdiag://dump     -> environment + client state + tail of the log
 //   qosdiag://reset    -> clear the log file and rewrite headers
+//   qosdiag://menu     -> open (toggle) the mod menu, no button needed
+//   qosdiag://ui       -> run one forced UI pass right now
 //
 // Handled by swizzling -[UIApplication openURL:options:completionHandler:] only
 // while the app is running; every other URL passes straight through untouched.
@@ -684,6 +743,10 @@ static void QMHookOpenURL(id self, SEL _cmd, id url, id options, id completion) 
         NSString *p = QMDiagPath();
         [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
         LOG(@"DIAG log reset");
+    } else if ([cmd hasPrefix:@"menu"]) {
+        QMShowMenu();
+    } else if ([cmd hasPrefix:@"ui"]) {
+        QMEnsureUI();
     } else {
         QMDiagDumpEnvironment();
         QMDiagDumpState(client);

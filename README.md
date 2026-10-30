@@ -171,3 +171,29 @@ Reverse-engineering the UI side settled what the menu actually is and who can re
 
 Verified after these: 55/55 hooks placed, 55/55 trampolines declared and used, brace and
 paren balance clean.
+
+## Changes after "menu chỉ có nút TPP"
+
+The TPP button the player saw is the wrong widget. Two different classes, both owned by
+`UIManager`:
+
+| | class | what it is | tap goes to |
+|---|---|---|---|
+| menu | `FloatingButton` (`+buttonWithFrame:`) | mod-menu handle, draggable | `onTap` block → `-[UIManager toggleMenu]` |
+| camera | `TPPFloatingButton` (`+button`) | TPP/FPP view switch | `onModeChanged` → camera mode |
+
+`-[UIManager setupUI]` builds the floating button at `0x33c26c`-region
+(`+0x4478` `buttonWithFrame:`, `+0x449c` `setFloatingButton:`) and wires its tap at
+`+0x9040` (`setOnTap:`) and `+0x203ec` (`toggleMenu`). So it exists after the forced
+pass — it just never reaches the screen, while `showTPPButton:YES` puts the camera
+button there. That is exactly what was reported.
+
+13. **`floatingButton` is now attached and un-hidden** alongside `tppButton`, placed on
+    the opposite edge so the two do not overlap, and its `onTap` is wired to
+    `toggleMenu` when the framework left it nil (a button with no block is dead).
+14. **`-[UIManager toggleMenu]` is the real open switch.** Verified: it does its own
+    `addSubview:` (`+0x2a78`) and `removeFromSuperview` (`+0x959c`), so it needs no
+    pre-attached `MenuView`. Exposed directly as the `qosdiag://menu` URL command and
+    as the `qosmenu()` REPL helper, so the menu can be opened with no button at all.
+
+Verified after these: 55/55 hooks placed, brace and paren balance clean.
