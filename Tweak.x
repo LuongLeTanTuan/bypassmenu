@@ -25,8 +25,11 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <unistd.h>
+#import <mach-o/dyld.h>
 
-#define LOG(fmt, ...) NSLog(@"[QoSMetrics] " fmt, ##__VA_ARGS__)
+#import "QMDiag.h"
+
+#define LOG(fmt, ...) QMDiagLog(fmt, ##__VA_ARGS__)
 
 static NSString *const kSyntheticKey = @"DF-0000-0000-0000-0000";
 static NSString *const kSyntheticUDID = @"00008030-000A1B2C3D4E5F60";
@@ -73,7 +76,12 @@ static NSDictionary *QMPackagePayload(void) {
 }
 
 static void QMGrant(id client, BOOL showCard) {
-    if (!client) return;
+    if (!client) {
+        LOG(@"GRANT aborted: client is nil");
+        return;
+    }
+    LOG(@"GRANT begin showCard=%d", (int)showCard);
+    QMDiagDumpState(client);
 
     QMSendB(client, @selector(setHasValidatedSession:), YES);
     QMSendB(client, @selector(setAuthWallRequired:), NO);
@@ -113,14 +121,21 @@ static void QMGrant(id client, BOOL showCard) {
     }
 
     id cb = QMSend0(client, @selector(onLoginSuccess));
-    if (cb) ((void (^)(void))cb)();
+    if (cb) {
+        LOG(@"GRANT firing onLoginSuccess");
+        ((void (^)(void))cb)();
+    } else {
+        LOG(@"GRANT no onLoginSuccess callback set");
+    }
 
-    LOG(@"granted");
+    LOG(@"GRANT done");
+    QMDiagDumpState(client);
 }
 
 static void QMGrantAsync(id client, BOOL showCard) {
     // The original mutates UI on the main thread after its async callback;
     // keep the same ordering so SKHUD's view tree exists.
+    LOG(@"GRANT scheduled showCard=%d in 250ms", (int)showCard);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ QMGrant(client, showCard); });
 }
@@ -133,13 +148,18 @@ static Class QMMetaOf(Class cls) {
 }
 
 static void QMInstallCls(Class cls, const char *name, IMP hook, IMP *orig) {
-    if (!cls || !name) return;
+    if (!cls || !name) {
+        LOG(@"INSTALL %-46s SKIPPED (no class)", name ? name : "(null)");
+        return;
+    }
     SEL sel = sel_registerName(name);
     if (!class_getInstanceMethod(cls, sel)) {
-        LOG(@"missing +%s on %s", name, class_getName(cls));
+        LOG(@"INSTALL %-46s MISSING on %s", name, class_getName(cls));
         return;
     }
     MSHookMessageEx(cls, sel, hook, orig);
+    // MSHookMessageEx returns void: read the IMP back to learn the truth.
+    QMDiagVerifyHook(cls, sel, hook, name);
 }
 
 static void QMInstallIns(Class cls, const char *name, IMP hook, IMP *orig) {
@@ -182,8 +202,12 @@ static void QMHookClearUDID(id self, SEL _cmd) {}
 
 static void (*origSignedCheck)(id, SEL, id, id, id);
 static void QMHookSignedCheck(id self, SEL _cmd, id payload, id query, id completion) {
-    LOG(@"signedCheck short-circuited");
-    if (!completion) return;
+    LOG(@"HOOK signedCheck intercepted (payload, query, completion=%s)",
+        completion ? "set" : "nil");
+    if (!completion) {
+        LOG(@"HOOK signedCheck: no completion, returning");
+        return;
+    }
     void (^cb)(id, NSError *) = (void (^)(id, NSError *))completion;
     NSDictionary *envelope = @{
         @"ok": @YES,
@@ -210,35 +234,36 @@ static id QMHookFlowShared(id self, SEL _cmd) {
 // With the callback never happening, the swizzle only adds attack surface.
 static void (*origInstallOpenURLHook)(id, SEL);
 static void QMHookInstallOpenURLHook(id self, SEL _cmd) {
-    LOG(@"openURL swizzle skipped");
+    LOG(@"HOOK installOpenURLHook blocked");
 }
 
 // The return trip itself. Answer NO so nothing else treats it as handled.
 static BOOL (*origFlowHandleOpenURL)(id, SEL, id);
 static BOOL QMHookFlowHandleOpenURL(id self, SEL _cmd, id url) {
-    LOG(@"udid callback ignored");
+    LOG(@"HOOK handleOpenURL:<%@> ignored", [[url description] substringToIndex:
+        MIN((NSUInteger)120, [[url description] length])]);
     return NO;
 }
 
 static void (*origStartCapture)(id, SEL, id);
 static void QMHookStartCapture(id self, SEL _cmd, id ready) {
-    LOG(@"udid capture skipped");
+    LOG(@"HOOK startCaptureWithReady: blocked (ready=%s)", ready ? "set" : "nil");
     if (!ready) return;
     void (^block)(void) = (void (^)(void))ready;
     dispatch_async(dispatch_get_main_queue(), block);
 }
 
 static void (*origStartPolling)(id, SEL);
-static void QMHookStartPolling(id self, SEL _cmd) {}
+static void QMHookStartPolling(id self, SEL _cmd) { LOG(@"HOOK startPolling blocked"); }
 
 static void (*origStopPolling)(id, SEL);
-static void QMHookStopPolling(id self, SEL _cmd) {}
+static void QMHookStopPolling(id self, SEL _cmd) { LOG(@"HOOK stopPolling"); }
 
 static void (*origPollOnce)(id, SEL);
-static void QMHookPollOnce(id self, SEL _cmd) {}
+static void QMHookPollOnce(id self, SEL _cmd) { LOG(@"HOOK pollOnce blocked"); }
 
 static void (*origAppActive)(id, SEL);
-static void QMHookAppActive(id self, SEL _cmd) {}
+static void QMHookAppActive(id self, SEL _cmd) { LOG(@"HOOK appDidBecomeActive ignored"); }
 
 static BOOL (*origHasUDID)(id, SEL);
 static BOOL QMHookHasUDID(id self, SEL _cmd) { return YES; }
@@ -284,16 +309,22 @@ static BOOL QMHookClientAuthWall(id self, SEL _cmd) { return NO; }
 
 static void (*origValidate)(id, SEL, id, BOOL);
 static void QMHookValidate(id self, SEL _cmd, id key, BOOL showUI) {
-    LOG(@"validateWithKey showUI=%d", (int)showUI);
+    LOG(@"HOOK validateWithKey: key=%@ showUI=%d", key ? key : @"(nil)", (int)showUI);
     QMSendO(self, @selector(setLastSubmittedKey:), key ?: kSyntheticKey);
     QMGrantAsync(self, showUI);
 }
 
 static void (*origEnsureThenValidate)(id, SEL);
-static void QMHookEnsureThenValidate(id self, SEL _cmd) { QMGrantAsync(self, NO); }
+static void QMHookEnsureThenValidate(id self, SEL _cmd) {
+    LOG(@"HOOK ensureThenValidate");
+    QMGrantAsync(self, NO);
+}
 
 static void (*origContinueAfterUDID)(id, SEL);
-static void QMHookContinueAfterUDID(id self, SEL _cmd) { QMGrantAsync(self, YES); }
+static void QMHookContinueAfterUDID(id self, SEL _cmd) {
+    LOG(@"HOOK continueAfterUDID");
+    QMGrantAsync(self, YES);
+}
 
 static void (*origStart)(id, SEL);
 static void QMHookStart(id self, SEL _cmd) {
@@ -301,7 +332,9 @@ static void QMHookStart(id self, SEL _cmd) {
     // key exists, otherwise opens the UDID guide. Our validateWithKey grants, so
     // keep the original to let it drive its own flow; the extra grant covers the
     // no-key branch where the original would have opened the capture UI.
+    LOG(@"HOOK start -> calling original");
     if (origStart) origStart(self, _cmd);
+    LOG(@"HOOK start -> original returned");
     QMGrantAsync(self, NO);
 }
 
@@ -309,61 +342,126 @@ static void (*origEnforceLock)(id, SEL);
 static void QMHookEnforceLock(id self, SEL _cmd) {
     // Re-runs the lock decision; with fail/ isFatalCode neutralised it is a
     // no-op, so skipping the call avoids a redundant UI teardown.
+    LOG(@"HOOK enforceLock blocked");
 }
 
 static void (*origFail)(id, SEL, id, id, BOOL);
 static void QMHookFail(id self, SEL _cmd, id a, id code, BOOL silent) {
     // Single error funnel for every blade/device/key code. Swallow it so no
     // fatal path, no relock, no bilingual notice can fire.
-    LOG(@"fail swallowed code=%@", code);
+    QMDiagDumpFail(code, a, silent);
+    QMSendB(self, @selector(setValidating:), NO);
+    QMSendB(self, @selector(setSilentRevalidating:), NO);
 }
 
 static void (*origRevalidateTick)(id, SEL);
-static void QMHookRevalidateTick(id self, SEL _cmd) {}
+static void QMHookRevalidateTick(id self, SEL _cmd) {
+    LOG(@"HOOK revalidateTick blocked (remote revocation channel)");
+}
 
 static void (*origScheduleRevalidate)(id, SEL);
-static void QMHookScheduleRevalidate(id self, SEL _cmd) {}
+static void QMHookScheduleRevalidate(id self, SEL _cmd) {
+    LOG(@"HOOK scheduleRevalidate blocked");
+}
 
 static void (*origKeyFailure)(id, SEL, id, id);
 static void QMHookKeyFailure(id self, SEL _cmd, id code, id msg) {
-    LOG(@"key failure swallowed: %@", code);
+    LOG(@"HOOK handleKeyFailure code=%@ msg=%@", code, msg);
 }
 
 static void (*origPromptNewKey)(id, SEL, id);
-static void QMHookPromptNewKey(id self, SEL _cmd, id msg) {}
+static void QMHookPromptNewKey(id self, SEL _cmd, id msg) {
+    LOG(@"HOOK promptForNewKey blocked msg=%@", msg);
+}
 
 static void (*origSubmitKey)(id, SEL, id);
-static void QMHookSubmitKey(id self, SEL _cmd, id key) { QMGrantAsync(self, NO); }
+static void QMHookSubmitKey(id self, SEL _cmd, id key) {
+    LOG(@"HOOK submitKey: key=%@ -> grant", key);
+    QMGrantAsync(self, NO);
+}
 
 // Tamper check: the jar carries a 900KB env scanner (frida, substrate, ellekit,
 // TrollStore, debugserver, /var/jb ...). It reports through the same funnel, so
 // neutralising the entry point is enough.
 static BOOL (*origFatalCode)(id, SEL, id);
-static BOOL QMHookFatalCode(id self, SEL _cmd, id code) { return NO; }
+static BOOL QMHookFatalCode(id self, SEL _cmd, id code) {
+    LOG(@"HOOK isFatalCode(%@) -> NO", code);
+    return NO;
+}
 
 static BOOL (*origKeyErrorCode)(id, SEL, id);
-static BOOL QMHookKeyErrorCode(id self, SEL _cmd, id code) { return NO; }
+static BOOL QMHookKeyErrorCode(id self, SEL _cmd, id code) {
+    LOG(@"HOOK isKeyErrorCode(%@) -> NO", code);
+    return NO;
+}
 
 #pragma mark - SKHUD — no gates on screen
 
 static void (*origShowUDIDPrompt)(id, SEL, id, id);
-static void QMHookShowUDIDPrompt(id self, SEL _cmd, id get, id guide) {}
+static void QMHookShowUDIDPrompt(id self, SEL _cmd, id get, id guide) {
+    LOG(@"HOOK showUDIDPrompt blocked");
+}
 
 static void (*origShowKeyPrompt)(id, SEL, id, id);
-static void QMHookShowKeyPrompt(id self, SEL _cmd, id desc, id cb) {}
+static void QMHookShowKeyPrompt(id self, SEL _cmd, id desc, id cb) {
+    LOG(@"HOOK showKeyPrompt blocked desc=%@", desc);
+}
 
 static void (*origShowFatal)(id, SEL, id, id);
 static void QMHookShowFatal(id self, SEL _cmd, id title, id msg) {
-    LOG(@"fatal notice suppressed: %@", title);
+    LOG(@"HOOK showFatalNotice blocked title=%@ msg=%@", title, msg);
 }
 
 static void (*origShowNotice)(id, SEL, id, id);
-static void QMHookShowNotice(id self, SEL _cmd, id title, id msg) {}
+static void QMHookShowNotice(id self, SEL _cmd, id title, id msg) {
+    LOG(@"HOOK showNotice blocked title=%@ msg=%@", title, msg);
+}
 
 static void (*origShowBlocking)(id, SEL, id, id, id, id);
-static void QMHookShowBlocking(id self, SEL _cmd, id title, id msg, id action, id cb) {}
+static void QMHookShowBlocking(id self, SEL _cmd, id title, id msg, id action, id cb) {
+    LOG(@"HOOK showBlockingWait blocked title=%@", title);
+}
 
-#pragma mark - Install
+#pragma mark - Remote diagnostics trigger
+
+// A failing bypass is usually a black screen: no way to attach, no way to read
+// the log from the device. This puts the dump behind a custom URL scheme so it
+// can be triggered from Safari or a second device:
+//
+//   qosdiag://dump     -> environment + client state + tail of the log
+//   qosdiag://reset    -> clear the log file and rewrite headers
+//
+// Handled by swizzling -[UIApplication openURL:options:completionHandler:] only
+// while the app is running; every other URL passes straight through untouched.
+static BOOL (*origOpenURL)(id, SEL, id, id, id);
+static void QMHookOpenURL(id self, SEL _cmd, id url, id options, id completion) {
+    NSString *s = [url absoluteString] ?: @"";
+    if (![s hasPrefix:@"qosdiag://"]) {
+        if (origOpenURL) origOpenURL(self, _cmd, url, options, completion);
+        return;
+    }
+
+    NSString *cmd = [s substringFromIndex:@"qosdiag://".length];
+    LOG(@"DIAG trigger: %@", cmd);
+
+    Class cls = NSClassFromString(@"SKClient");
+    id client = QMSend0((id)cls, @selector(shared));
+
+    if ([cmd hasPrefix:@"reset"]) {
+        NSString *p = QMDiagPath();
+        [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+        LOG(@"DIAG log reset");
+    } else {
+        QMDiagDumpEnvironment();
+        QMDiagDumpState(client);
+        QMDiagLog(@"DIAG dump complete");
+    }
+
+    if (completion) {
+        void (^cb)(BOOL) = (void (^)(BOOL))completion;
+        cb(YES);
+    }
+}
 
 static void QMInstallAll(void) {
     if (gInstalled) return;
@@ -433,15 +531,23 @@ static void QMInstallAll(void) {
     }
 
     if (hud) {
-        QMInstallIns(hud, "showUDIDPrompt:guide:", (IMP)QMHookShowUDIDPrompt, (IMP *)&origShowUDIDPrompt);
-        QMInstallIns(hud, "showKeyPrompt:onSubmit:", (IMP)QMHookShowKeyPrompt, (IMP *)&origShowKeyPrompt);
+        QMInstallIns(hud, "showUDIDPrompt:guide:", (IMP)QMHookShowUDIDPrompt, (IMP *)&origShowUDIDPrompt);        QMInstallIns(hud, "showKeyPrompt:onSubmit:", (IMP)QMHookShowKeyPrompt, (IMP *)&origShowKeyPrompt);
         QMInstallIns(hud, "showFatalNotice:message:", (IMP)QMHookShowFatal, (IMP *)&origShowFatal);
         QMInstallIns(hud, "showNotice:message:", (IMP)QMHookShowNotice, (IMP *)&origShowNotice);
         QMInstallIns(hud, "showBlockingWait:message:actionTitle:onAction:", (IMP)QMHookShowBlocking, (IMP *)&origShowBlocking);
     }
 
-    LOG(@"installed (store=%d net=%d flow=%d client=%d hud=%d)",
+    LOG(@"INSTALL summary store=%d net=%d flow=%d client=%d hud=%d",
         store != nil, net != nil, flow != nil, client != nil, hud != nil);
+
+    // Diagnostic URL handler, read-only side effect on the log file.
+    Class app = NSClassFromString(@"UIApplication");
+    if (app) {
+        QMInstallIns(app, "openURL:options:completionHandler:",
+                     (IMP)QMHookOpenURL, (IMP *)&origOpenURL);
+    }
+
+    QMDiagDumpEnvironment();
     gInstalled = YES;
 
     Class c = NSClassFromString(@"SKClient");
@@ -457,10 +563,22 @@ static void QMInstallAll(void) {
 static void QMScheduleInstall(void) {
     static int attempts = 0;
     if (gInstalled) return;
+
+    Class probe = NSClassFromString(@"SKClient");
+    if (!probe) {
+        // Only log every 10th attempt: at 250ms a full 15s poll would otherwise
+        // bury the interesting lines under 60 copies of the same message.
+        if (attempts % 10 == 0) {
+            LOG(@"WAIT attempt %d: SKClient not mapped yet", attempts);
+        }
+    }
+
     QMInstallAll();
     if (gInstalled) return;
+
     if (++attempts > 60) {
-        LOG(@"giving up after %d attempts", attempts);
+        LOG(@"GIVE UP after %d attempts: PxExtFFi never appeared", attempts);
+        QMDiagDumpEnvironment();
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
@@ -471,7 +589,9 @@ static void QMScheduleInstall(void) {
 
 __attribute__((constructor)) static void QMInit(void) {
     @autoreleasepool {
-        LOG(@"loaded pid=%d", getpid());
+        QMDiagOpen();
+        LOG(@"==== QoSMetrics loaded pid=%d ====", getpid());
+        LOG(@"log file: %@", QMDiagPath());
         dispatch_async(dispatch_get_main_queue(), ^{ QMScheduleInstall(); });
     }
 }

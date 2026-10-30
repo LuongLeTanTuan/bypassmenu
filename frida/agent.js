@@ -22,18 +22,107 @@ const log = (s) => console.log('[QoSMetrics] ' + s);
 const str = (s) => ObjC.classes.NSString.stringWithString_(s);
 const safe = (fn, d) => { try { return fn(); } catch (e) { return d; } };
 
-/* Hook an ObjC method. prefix is '-' or '+'. fn receives (self, orig, ...args). */
+/* Read an IMP back after hooking. Frida's setter is silent on failure, so a
+ * hook that never landed would otherwise look identical to one that did. */
+function verify(cls, prefix, sel, expected) {
+  try {
+    const m = cls[prefix + ' ' + sel];
+    if (!m) { log('VERIFY ' + prefix + sel + ' MISSING'); return false; }
+    const got = m.implementation.toString();
+    const ok = got === expected.toString();
+    log('VERIFY ' + prefix + sel + ' ' + (ok ? 'OK' : 'MISMATCH'));
+    return ok;
+  } catch (e) {
+    log('VERIFY ' + prefix + sel + ' ERROR ' + e);
+    return false;
+  }
+}
+
+/* Describe a value for the log without dumping user data wholesale. */
+function describe(v) {
+  if (!v || v.isNull()) return 'nil';
+  try {
+    const cls = v.$className;
+    if (cls === 'NSString') {
+      const s = v.toString();
+      return 'NSString("' + (s.length > 80 ? s.slice(0, 80) + '…' : s) + '") len=' + s.length;
+    }
+    if (cls === 'NSNumber') return 'NSNumber(' + v.toString() + ')';
+    if (cls === 'NSDate') return 'NSDate(' + v.toString() + ')';
+    if (cls === 'NSDictionary') {
+      const keys = safe(() => v.allKeys(), null);
+      const n = safe(() => v.count(), 0);
+      if (keys && n > 0 && n <= 12) {
+        const names = [];
+        for (let i = 0; i < n; i++) {
+          const k = keys.objectAtIndex_(i);
+          if (k.$className === 'NSString') names.push(k.toString());
+        }
+        return 'NSDictionary(' + n + ') keys=[' + names.join(',') + ']';
+      }
+      return 'NSDictionary(' + n + ')';
+    }
+    if (cls === 'NSArray') return 'NSArray(' + safe(() => v.count(), 0) + ')';
+    return cls;
+  } catch (e) {
+    return '<unreadable>';
+  }
+}
+
+/* Full state snapshot — this is what tells you why a bypass failed. */
+function dumpState(client) {
+  log('---- client state ----');
+  const sels = ['savedKey', 'udidValue', 'token', 'sessionToken', 'resolvedToken',
+                'expiryDate', 'expiredAtString', 'packageName', 'lastFailCode',
+                'packagePayload', 'devicePayload', 'paidChallenge'];
+  for (const sel of sels) {
+    const v = call(client, sel, []);
+    log('  ' + sel.padEnd(18) + ' = ' + describe(v));
+  }
+  const bools = ['hasValidatedSession', 'authWallRequired', 'validating',
+                 'silentRevalidating', 'successCardShown', 'hideUI'];
+  for (const sel of bools) {
+    const v = call(client, sel, []);
+    log('  ' + sel.padEnd(18) + ' = ' + (v ? 'YES' : 'NO'));
+  }
+  const pc = call(client, 'paidCount', []);
+  log('  ' + 'paidCount'.padEnd(18) + ' = ' + pc);
+}
+
+function dumpEnvironment() {
+  log('---- environment ----');
+  log('pid      : ' + Process.id);
+  log('arch     : ' + Process.arch);
+  log('platform : ' + Process.platform);
+  const imgs = Process.enumerateModules().filter(m =>
+    /PxExt|QoSMetrics|DeltaForce/.test(m.name) || /substrate/i.test(m.name));
+  log('---- load order ----');
+  imgs.forEach(m => log('  ' + m.name + ' base=' + m.base + ' size=' + m.size));
+  log('---- gate classes ----');
+  const names = ['SKClient', 'SKStore', 'SKNetwork', 'SKUDIDFlow', 'SKHUD',
+                 'SKOverlayVC', 'UIManager', 'MenuView', 'TPPFloatingButton',
+                 'BypassEarlyLoader'];
+  names.forEach(n => log('  ' + n.padEnd(18) + (ObjC.classes[n] ? 'present' : 'ABSENT')));
+}
+
+/* Hook an ObjC method. prefix is '-' or '+'. fn receives (self, orig, ...args).
+ * Returns the original IMP, or null when the hook did not land. */
 function hook(cls, prefix, sel, fn) {
   if (!cls) return null;
   const key = prefix + ' ' + sel;
   let method = null;
   try { method = cls[key]; } catch (e) { method = null; }
-  if (!method) { log('missing ' + key); return null; }
+  if (!method) { log('INSTALL ' + key + ' MISSING'); return null; }
   const orig = method.implementation;
-  method.implementation = function () {
+  const wrapper = function () {
     const args = [].slice.call(arguments);
     return fn.apply(null, [this, orig].concat(args));
   };
+  method.implementation = wrapper;
+  // Read it back: Frida's setter is silent, so verify rather than assume.
+  const back = safe(() => cls[key].implementation, null);
+  const ok = back && back.toString() === wrapper.toString();
+  log('INSTALL ' + key + ' ' + (ok ? 'OK' : 'MISMATCH'));
   return orig;
 }
 
@@ -46,7 +135,9 @@ function call(obj, sel, args) {
 /* ------------------------------------------------------------- success path */
 
 function grant(client) {
-  if (!client || client.isNull()) return;
+  if (!client || client.isNull()) { log('GRANT aborted: client nil'); return; }
+  log('GRANT begin');
+  dumpState(client);
   call(client, 'setHasValidatedSession:', [1]);
   call(client, 'setAuthWallRequired:', [0]);
   call(client, 'setValidating:', [0]);
@@ -77,9 +168,14 @@ function grant(client) {
   }
 
   const cb = call(client, 'onLoginSuccess', []);
-  if (cb && !cb.isNull()) safe(() => new ObjC.Block(cb).implementation());
-
-  log('granted');
+  if (cb && !cb.isNull()) {
+    log('GRANT firing onLoginSuccess');
+    safe(() => new ObjC.Block(cb).implementation());
+  } else {
+    log('GRANT no onLoginSuccess callback');
+  }
+  log('GRANT done');
+  dumpState(client);
 }
 
 function grantAsync(client) {
@@ -200,6 +296,7 @@ function install() {
   hook(SKHUD, '-', 'showBlockingWait:message:actionTitle:onAction:', function () {});
 
   log('installed');
+  dumpEnvironment();
 
   const shared = safe(() => SKClient.shared(), null);
   if (shared && !shared.isNull()) grant(shared);
@@ -208,8 +305,41 @@ function install() {
 /* PxExtFFi may not be mapped yet at attach time: poll, bounded. */
 let attempts = 0;
 const timer = setInterval(() => {
+  if (!ObjC.classes.SKClient && attempts % 10 === 0) {
+    log('WAIT attempt ' + attempts + ': SKClient not mapped yet');
+  }
   safe(install);
-  if (installed || ++attempts > 120) clearInterval(timer);
+  if (installed || ++attempts > 120) {
+    clearInterval(timer);
+    if (!installed) log('GIVE UP after ' + attempts + ' attempts');
+  }
 }, 250);
 
+/* Live diagnostics — type these in the Frida REPL once attached.
+ *
+ *   qos()        full state dump
+ *   qosenv()     modules, load order, class presence
+ *   qosgrant()   force a grant right now
+ *   qoshelp()    this list
+ */
+globalThis.qos = () => {
+  const c = safe(() => ObjC.classes.SKClient.shared(), null);
+  dumpState(c);
+  return 'ok';
+};
+globalThis.qosenv = () => { dumpEnvironment(); return 'ok'; };
+globalThis.qosgrant = () => {
+  const c = safe(() => ObjC.classes.SKClient.shared(), null);
+  grant(c);
+  return 'ok';
+};
+globalThis.qoshelp = () => {
+  ['qos()      - dump SKClient state',
+   'qosenv()   - dump modules / load order / classes',
+   'qosgrant() - force grant now',
+   'qoshelp()  - this list'].forEach(log);
+  return 'ok';
+};
+
 log('agent loaded pid=' + Process.id);
+log('repl: qoshelp() for diagnostics');

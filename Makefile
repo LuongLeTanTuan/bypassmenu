@@ -4,7 +4,7 @@ ARCHS := arm64 arm64e
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = QoSMetrics
-QoSMetrics_FILES = Tweak.x
+QoSMetrics_FILES = Tweak.x QMDiag.m
 QoSMetrics_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 QoSMetrics_FRAMEWORKS = Foundation UIKit
 QoSMetrics_LIBRARIES = substrate
