@@ -562,8 +562,19 @@ function showMenu() {
   const menu = call(mgr, 'menu', []);
   const win = keyWindow();
   if (menu && !menu.isNull()) attachToWindow(menu, win, false);
-  log('MENU: toggleMenu');
+
+  const wasVisible = !!(menu && !menu.isNull() && menu.hidden && menu.hidden() === 0);
+  log('MENU: toggleMenu (wasVisible=' + wasVisible + ')');
   call(mgr, 'toggleMenu', []);
+
+  /* toggleMenu has its own guards; if it opened nothing, show the view here. */
+  if (menu && !menu.isNull() && !wasVisible && menu.hidden && menu.hidden() !== 0) {
+    log('MENU: toggleMenu no-op -> forcing MenuView visible');
+    if (win && !win.isNull()) attachToWindow(menu, win, false);
+    safe(() => menu.setHidden_(0));
+    safe(() => menu.setAlpha_(1));
+    if (win && !win.isNull()) safe(() => win.bringSubviewToFront_(menu));
+  }
   logView('MENU: menu after toggle', call(mgr, 'menu', []));
 }
 

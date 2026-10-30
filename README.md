@@ -198,6 +198,21 @@ button there. That is exactly what was reported.
 
 Verified after these: 55/55 hooks placed, brace and paren balance clean.
 
+## Changes after "vẫn không thấy icon để bật menu"
+
+Everything the framework owns stayed invisible, so the entry point stops depending on
+it. `FloatingButton` is still built and wired, but it is no longer the only way in.
+
+17. **A plain `UIButton` labelled `MENU` is placed on the key window** (64×64 at 16,96,
+    black 55% fill, white ring). No framework class, no image asset, no `-setupUI` — it
+    cannot fail to render. Tap → `QMShowMenu`. Re-attached and brought to front on every
+    UI pass (0.5 / 1.5 / 3 / 6 / 10 s) so a later game view cannot bury it.
+18. **`QMShowMenu` no longer trusts `-[UIManager toggleMenu]`.** It records whether the
+    menu was visible, calls `toggleMenu`, and if the call opened nothing (`wasVisible=0`,
+    still hidden) it attaches the `MenuView`, restores `hidden=NO` / `alpha=1`, and brings
+    it to the front itself. Closing still works because a second tap starts from
+    `wasVisible=1` and lets `toggleMenu` hide it.
+
 ## Changes after "vẫn không thấy icon"
 
 The forced `setupUI` never got far enough. What proved it: `-[UIManager showTPPButton:]`

@@ -22,6 +22,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <unistd.h>
@@ -154,6 +155,54 @@ static void QMInstallMenuGesture(UIWindow *win) {
     QMDiagLog(@"UI: two-finger tap installed on window %p", (__bridge void *)win);
 }
 
+// Last resort, and the one that actually cannot fail: a plain UIButton on the
+// key window. No framework class, no image asset, no -setupUI. When every widget
+// the framework owns stays invisible, this is still on screen and still taps.
+@interface QMMenuButtonTarget : NSObject
+- (void)qmMenuButtonTapped:(UIButton *)b;
+@end
+
+@implementation QMMenuButtonTarget
+- (void)qmMenuButtonTapped:(UIButton *)b {
+    QMDiagLog(@"BUTTON tap -> toggle menu");
+    QMShowMenu();
+}
+@end
+
+static QMMenuButtonTarget *gMenuButtonTarget = nil;
+static UIButton *gMenuButton = nil;
+
+static void QMInstallMenuButton(UIWindow *win) {
+    if (!win) return;
+    if (!gMenuButtonTarget) gMenuButtonTarget = [[QMMenuButtonTarget alloc] init];
+
+    if (!gMenuButton) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(16.0, 96.0, 64.0, 64.0);
+        b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        b.layer.cornerRadius = 32.0;
+        b.layer.borderWidth = 1.5;
+        b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
+        b.clipsToBounds = YES;
+        [b setTitle:@"MENU" forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [b addTarget:gMenuButtonTarget
+              action:@selector(qmMenuButtonTapped:)
+    forControlEvents:UIControlEventTouchUpInside];
+        gMenuButton = b;
+        QMDiagLog(@"UI: plain menu button created");
+    }
+    if (gMenuButton.superview != win) {
+        [win addSubview:gMenuButton];
+        QMDiagLog(@"UI: plain menu button attached to %p", (__bridge void *)win);
+    }
+    gMenuButton.hidden = NO;
+    gMenuButton.alpha = 1.0;
+    gMenuButton.userInteractionEnabled = YES;
+    [win bringSubviewToFront:gMenuButton];
+}
+
 static void QMLogView(NSString *label, id view) {
     if (!view || ![view isKindOfClass:[UIView class]]) {
         QMDiagLog(@"%@ = %p (not a view)", label, (__bridge void *)view);
@@ -235,6 +284,7 @@ static void QMEnsureUI(void) {
     QMDiagLog(@"UI: keyWindow=%p bounds=%@", (__bridge void *)win,
               win ? NSStringFromCGRect(win.bounds) : @"(none)");
     QMInstallMenuGesture(win);
+    QMInstallMenuButton(win);
 
     // setupUI bailed before creating the menu -> build one. MenuView fills
     // itself in -setupUI, including its own tab bar, so this is not a shell.
@@ -341,8 +391,29 @@ static void QMShowMenu(void) {
             QMDiagLog(@"MENU: MenuView had no window -> attached");
         }
     }
-    QMDiagLog(@"MENU: toggleMenu");
+
+    UIView *mv = [menu isKindOfClass:[UIView class]] ? (UIView *)menu : nil;
+    BOOL wasVisible = mv && mv.window && !mv.hidden && mv.alpha > 0.01;
+
+    QMDiagLog(@"MENU: toggleMenu (wasVisible=%d)", (int)wasVisible);
     QMSendV(shared, @selector(toggleMenu));
+
+    if (mv) {
+        BOOL nowVisible = mv.window && !mv.hidden && mv.alpha > 0.01;
+        // toggleMenu is the framework's own open/close switch, but it is also a
+        // 146 KB obfuscated neighbour of setupUI with its own guards. If it
+        // opened nothing while the menu was closed, put the view up ourselves.
+        if (!wasVisible && !nowVisible) {
+            QMDiagLog(@"MENU: toggleMenu no-op -> forcing MenuView visible");
+            UIWindow *win = QMKeyWindow();
+            if (!mv.window && win) [win addSubview:mv];
+            if (CGRectIsEmpty(mv.frame) && win) mv.frame = win.bounds;
+            mv.hidden = NO;
+            mv.alpha = 1.0;
+            mv.userInteractionEnabled = YES;
+            if (win) [win bringSubviewToFront:mv];
+        }
+    }
     QMLogView(@"MENU: menu after toggle", QMSend0(shared, @selector(menu)));
 }
 
