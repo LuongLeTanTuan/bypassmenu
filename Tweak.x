@@ -59,6 +59,11 @@ static void QMSendOOO(id t, SEL s, id a, id b, id c) {
     if (!t || ![t respondsToSelector:s]) return;
     ((void (*)(id, SEL, id, id, id))[t methodForSelector:s])(t, s, a, b, c);
 }
+// BOOL getter: QMSend0 would misinterpret the return register.
+static BOOL QMSendB0(id t, SEL s) {
+    if (!t || ![t respondsToSelector:s]) return NO;
+    return ((BOOL (*)(id, SEL))[t methodForSelector:s])(t, s);
+}
 
 #pragma mark - Success path (mirrors -[SKClient handleResponse:error:] tail)
 
@@ -105,49 +110,152 @@ static UIWindow *QMKeyWindow(void) {
             if (cand.isKeyWindow) return cand;
         }
     }
+    // Pre-iOS-13 fallback and the case where the key window is still nil during
+    // launch: the first window in the scene stack is good enough to parent to.
+    if (!w) {
+        for (UIScene *s in [[UIApplication sharedApplication] connectedScenes]) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *cand in ((UIWindowScene *)s).windows) { w = cand; break; }
+            if (w) break;
+        }
+    }
+    if (!w) w = [UIApplication sharedApplication].keyWindow;
     return w;
 }
 
-// The menu and the floating button are built by -[UIManager setupUI]. The
-// framework calls it once it considers the client licensed; calling it a second
-// time builds a duplicate tree and orphans the first, which is why the earlier
-// version could leave no visible menu at all. Force it only when the tree is
-// genuinely missing, and re-attach a button that was built before the key
-// window existed — a view with no window is invisible.
+static void QMLogView(NSString *label, id view) {
+    if (!view || ![view isKindOfClass:[UIView class]]) {
+        QMDiagLog(@"%@ = %p (not a view)", label, (__bridge void *)view);
+        return;
+    }
+    UIView *v = (UIView *)view;
+    QMDiagLog(@"%@ = %s %p frame=%@ hidden=%d alpha=%.2f superview=%p window=%p",
+              label, class_getName([v class]), (__bridge void *)v,
+              NSStringFromCGRect(v.frame), (int)v.hidden, (double)v.alpha,
+              (__bridge void *)v.superview, (__bridge void *)v.window);
+}
+
+// A view built before the key window existed has no window of its own — it
+// exists, is sized, and is completely invisible. Parent it again.
+static void QMAttachToWindow(id view, UIWindow *win, BOOL hideUnlessShown) {
+    if (!win || !view || ![view isKindOfClass:[UIView class]]) return;
+    UIView *v = (UIView *)view;
+    if (v.window) return;
+    BOOL wasHidden = v.hidden;
+    [win addSubview:v];
+    if (hideUnlessShown) v.hidden = YES; else v.hidden = wasHidden;
+    QMDiagLog(@"UI: attached %s to key window", class_getName([v class]));
+}
+
+// The menu and the floating button are built by -[UIManager setupUI]. Nothing
+// inside PxExtFFi ever calls +[UIManager shared] (verified: the class is
+// referenced only from its own methods, and the string "UIManager" appears
+// exactly once in __objc_classname), so the whole tree is dead code unless it
+// is forced. Nothing outside the framework calls it either — the game binary
+// contains no reference to this UIManager class at all.
 static void QMEnsureUI(void) {
     Class mgr = NSClassFromString(@"UIManager");
-    if (!mgr) { LOG(@"UI: UIManager absent"); return; }
+    if (!mgr) { QMDiagLog(@"UI: UIManager absent"); return; }
 
     id shared = QMSend0((id)mgr, @selector(shared));
-    if (!shared) { LOG(@"UI: UIManager.shared nil"); return; }
+    if (!shared) { QMDiagLog(@"UI: UIManager.shared nil"); return; }
+
+    if (![NSThread isMainThread]) {
+        QMDiagLog(@"UI: not on main thread -> hopping");
+        dispatch_async(dispatch_get_main_queue(), ^{ QMEnsureUI(); });
+        return;
+    }
 
     id menu = QMSend0(shared, @selector(menu));
     id tpp = QMSend0(shared, @selector(tppButton));
-    LOG(@"UI: before menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
+    QMDiagLog(@"UI: pass menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
 
     if (!menu && !tpp) {
-        LOG(@"UI: menu missing -> forcing setupUI");
+        QMDiagLog(@"UI: tree missing -> setupUI");
         QMSendV(shared, @selector(setupUI));
-        QMSendB(shared, @selector(showTPPButton:), YES);
         menu = QMSend0(shared, @selector(menu));
         tpp = QMSend0(shared, @selector(tppButton));
-        LOG(@"UI: after setupUI menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
+        QMDiagLog(@"UI: after setupUI menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
     }
 
-    if (tpp && [tpp isKindOfClass:[UIView class]]) {
+    // The button is also created here when setupUI produced nothing, and this
+    // is what un-hides an existing one.
+    QMSendB(shared, @selector(showTPPButton:), YES);
+    if ([shared respondsToSelector:@selector(updateTPPButtonState:)])
+        QMSendB(shared, @selector(updateTPPButtonState:), YES);
+
+    menu = QMSend0(shared, @selector(menu));
+    tpp = QMSend0(shared, @selector(tppButton));
+    id esp = QMSend0(shared, @selector(espOverlay));
+
+    UIWindow *win = QMKeyWindow();
+    QMDiagLog(@"UI: keyWindow=%p", (__bridge void *)win);
+
+    QMLogView(@"UI: menu", menu);
+    QMLogView(@"UI: tpp", tpp);
+    QMLogView(@"UI: esp", esp);
+
+    // The floating button is the handle the player opens the menu with, so it
+    // must be on screen and interactive.
+    if ([tpp isKindOfClass:[UIView class]]) {
         UIView *v = (UIView *)tpp;
-        if (!v.window) {
-            UIWindow *win = QMKeyWindow();
-            LOG(@"UI: tpp has no window (keyWindow=%p) -> re-attaching", (__bridge void *)win);
-            if (win) [win addSubview:v];
-        } else {
-            LOG(@"UI: tpp in window, hidden=%d alpha=%.2f", (int)v.hidden, (double)v.alpha);
-        }
+        QMAttachToWindow(v, win, NO);
+        if (v.hidden) { v.hidden = NO; QMDiagLog(@"UI: tpp un-hidden"); }
+        if (v.alpha < 0.99) { v.alpha = 1.0; QMDiagLog(@"UI: tpp alpha restored"); }
+        v.userInteractionEnabled = YES;
+        if (CGRectIsEmpty(v.frame) && win)
+            v.frame = CGRectMake(win.bounds.size.width - 72.0, 96.0, 56.0, 56.0);
     }
 
-    QMDiagLog(@"UI: final menu=%p tpp=%p",
+    // The menu view only needs a parent to be toggled into; keep it hidden so
+    // it never covers the game until the button is tapped.
+    if ([menu isKindOfClass:[UIView class]]) QMAttachToWindow(menu, win, YES);
+    if ([esp isKindOfClass:[UIView class]]) QMAttachToWindow(esp, win, YES);
+
+    QMDiagLog(@"UI: pass done menu=%p tpp=%p",
               (__bridge void *)QMSend0(shared, @selector(menu)),
               (__bridge void *)QMSend0(shared, @selector(tppButton)));
+}
+
+// The grant can land before the key window exists (launch, orientation change,
+// overlay teardown). Run a handful of passes instead of guessing one moment.
+static void QMEnsureUILater(void) {
+    static const double kDelays[] = {0.5, 1.5, 3.0, 6.0, 10.0};
+    for (size_t i = 0; i < sizeof(kDelays) / sizeof(kDelays[0]); i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                    (int64_t)(kDelays[i] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ QMEnsureUI(); });
+    }
+}
+
+// The three blocks the host app registers through the C API
+// (apiclient_on_check_package / on_check_device / on_login). This is the exact
+// tail of -[SKClient handleResponse:error:], verified in the disassembly:
+//
+//   if (onCheckPackage) onCheckPackage(sessionToken);
+//   if (onCheckDevice)  onCheckDevice(devicePayload, sessionToken);
+//   if (onLoginSuccess) onLoginSuccess();
+//
+// Missing any of them leaves the app's own post-login code — the part that
+// builds and enables its menu — never called, which is why a bypass that only
+// fired onLoginSuccess still showed no menu.
+static void QMFireCallbacks(id client) {
+    if (!client) return;
+
+    id token = QMSend0(client, @selector(sessionToken)) ?: kSyntheticToken;
+    id device = QMSend0(client, @selector(devicePayload)) ?: @{};
+
+    id cbPackage = QMSend0(client, @selector(onCheckPackage));
+    LOG(@"CALLBACK onCheckPackage=%s", cbPackage ? "set" : "nil");
+    if (cbPackage) ((void (^)(id))cbPackage)(token);
+
+    id cbDevice = QMSend0(client, @selector(onCheckDevice));
+    LOG(@"CALLBACK onCheckDevice=%s", cbDevice ? "set" : "nil");
+    if (cbDevice) ((void (^)(id, id))cbDevice)(device, token);
+
+    id cbLogin = QMSend0(client, @selector(onLoginSuccess));
+    LOG(@"CALLBACK onLoginSuccess=%s", cbLogin ? "set" : "nil");
+    if (cbLogin) ((void (^)(void))cbLogin)();
 }
 
 static void QMGrant(id client, BOOL showCard) {
@@ -159,15 +267,17 @@ static void QMGrant(id client, BOOL showCard) {
     QMDiagDumpState(client);
 
     QMApplyState(client);
+
+    // Callback order follows the framework: the host builds its UI from these,
+    // pending blocks run afterwards.
+    QMFireCallbacks(client);
     QMSendV(client, @selector(runPendingBlocks));
 
     id hud = QMSend0(client, @selector(hud));
     QMSendV(hud, @selector(hideLoading));
     QMSendV(hud, @selector(hideBlockingWait));
 
-    // Unlock the in-game surface first: the success card's ENTER GAME handler
-    // tears the overlay down, so the button must already exist underneath it.
-    QMEnsureUI();
+    QMEnsureUILater();
 
     if (showCard) {
         QMSendB(client, @selector(setSuccessCardShown:), YES);
@@ -180,13 +290,11 @@ static void QMGrant(id client, BOOL showCard) {
                   @"ACTIVATION SUCCESSFUL", @"Unlimited", onDone);
     }
 
-    id cb = QMSend0(client, @selector(onLoginSuccess));
-    if (cb) {
-        LOG(@"GRANT firing onLoginSuccess");
-        ((void (^)(void))cb)();
-    } else {
-        LOG(@"GRANT no onLoginSuccess callback set");
-    }
+    // Nothing may stay on top of the game: a prompt left up keeps SKHUD's
+    // blocking shield in the host view, which covers the menu and eats touches.
+    QMSendV(hud, @selector(dismissAll));
+    QMSendV(hud, @selector(dropShieldIfIdle));
+    LOG(@"GRANT overlay cleared (visible=%d)", (int)QMSendB0(hud, @selector(hasVisibleHUD)));
 
     LOG(@"GRANT done");
     QMDiagDumpState(client);
@@ -426,6 +534,39 @@ static void QMHookTeardownUI(id self, SEL _cmd) {
     LOG(@"HOOK teardownUI blocked");
 }
 
+// Observation only, no behaviour change: these answer "who builds the menu, and
+// does the framework ever reach it on its own". If nothing is logged for
+// +shared / -setupUI except our own forced pass, the tree really is dead code
+// in this build and the only way to it is the forced call.
+static id (*origUIShared)(id, SEL);
+static id QMHookUIShared(id self, SEL _cmd) {
+    id r = origUIShared ? origUIShared(self, _cmd) : nil;
+    LOG(@"HOOK +[UIManager shared] -> %p (external caller)", (__bridge void *)r);
+    return r;
+}
+
+static void (*origSetupUI)(id, SEL);
+static void QMHookSetupUI(id self, SEL _cmd) {
+    LOG(@"HOOK -[UIManager setupUI] enter");
+    if (origSetupUI) origSetupUI(self, _cmd);
+    QMLogView(@"HOOK setupUI menu", QMSend0(self, @selector(menu)));
+    QMLogView(@"HOOK setupUI tpp", QMSend0(self, @selector(tppButton)));
+}
+
+static void (*origShowTPP)(id, SEL, BOOL);
+static void QMHookShowTPP(id self, SEL _cmd, BOOL on) {
+    LOG(@"HOOK -[UIManager showTPPButton:%d]", (int)on);
+    if (origShowTPP) origShowTPP(self, _cmd, on);
+    QMLogView(@"HOOK showTPP tpp", QMSend0(self, @selector(tppButton)));
+}
+
+static void (*origToggleMenu)(id, SEL);
+static void QMHookToggleMenu(id self, SEL _cmd) {
+    LOG(@"HOOK -[UIManager toggleMenu]");
+    if (origToggleMenu) origToggleMenu(self, _cmd);
+    QMLogView(@"HOOK toggleMenu menu", QMSend0(self, @selector(menu)));
+}
+
 static void (*origEnforceLock)(id, SEL);
 static void QMHookEnforceLock(id self, SEL _cmd) {
     // Re-runs the lock decision; with fail/ isFatalCode neutralised it is a
@@ -637,6 +778,10 @@ static void QMInstallAll(void) {
     Class uiMgr = NSClassFromString(@"UIManager");
     if (uiMgr) {
         QMInstallIns(uiMgr, "teardownUI", (IMP)QMHookTeardownUI, (IMP *)&origTeardownUI);
+        QMInstallIns(uiMgr, "setupUI", (IMP)QMHookSetupUI, (IMP *)&origSetupUI);
+        QMInstallIns(uiMgr, "showTPPButton:", (IMP)QMHookShowTPP, (IMP *)&origShowTPP);
+        QMInstallIns(uiMgr, "toggleMenu", (IMP)QMHookToggleMenu, (IMP *)&origToggleMenu);
+        QMInstallCls(uiMgr, "shared", (IMP)QMHookUIShared, (IMP *)&origUIShared);
     }
 
     // Diagnostic URL handler, read-only side effect on the log file.

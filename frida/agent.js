@@ -153,9 +153,50 @@ function applyState(client) {
   call(client, 'setLastFailCode:', [NULL]);
 }
 
-/* The menu/overlay tree belongs to -[UIManager setupUI]. Forcing it a second
- * time builds a duplicate and orphans the first, so only call it when the tree
- * is genuinely missing; re-attach a button built before the window existed. */
+/* The menu/overlay tree belongs to -[UIManager setupUI]. Nothing inside
+ * PxExtFFi ever calls +[UIManager shared], and nothing outside it references
+ * this UIManager class either, so the tree is dead code unless it is forced. */
+function keyWindow() {
+  const app = ObjC.classes.UIApplication.sharedApplication();
+  let fallback = null;
+  const scenes = safe(() => app.connectedScenes(), null);
+  if (!scenes || scenes.isNull()) return safe(() => app.keyWindow(), null);
+  const n = scenes.count();
+  for (let i = 0; i < n; i++) {
+    const s = scenes.objectAtIndex_(i);
+    if (!safe(() => s.isKindOfClass_(ObjC.classes.UIWindowScene), 0)) continue;
+    const wins = safe(() => s.windows(), null);
+    if (!wins || wins.isNull()) continue;
+    const m = wins.count();
+    for (let j = 0; j < m; j++) {
+      const w = wins.objectAtIndex_(j);
+      if (!fallback) fallback = w;
+      if (safe(() => w.isKeyWindow(), 0)) return w;
+    }
+  }
+  return fallback || safe(() => app.keyWindow(), null);
+}
+
+function logView(label, v) {
+  if (!v || v.isNull()) { log(label + ' = nil'); return; }
+  log(label + ' ' + v.$className + ' hidden=' + safe(() => v.hidden(), '?') +
+      ' alpha=' + safe(() => v.alpha(), '?') +
+      ' frame=' + safe(() => JSON.stringify(v.frame()), '?') +
+      ' super=' + describe(safe(() => v.superview(), null)) +
+      ' win=' + describe(safe(() => v.window(), null)));
+}
+
+/* A view built before the key window existed has no window — it is sized,
+ * exists, and is completely invisible. Parent it again. */
+function attachToWindow(v, win, hide) {
+  if (!win || !v || v.isNull()) return;
+  const w = safe(() => v.window(), null);
+  if (w && !w.isNull()) return;
+  safe(() => win.addSubview_(v));
+  safe(() => v.setHidden_(hide ? 1 : 0));
+  log('UI: attached ' + v.$className);
+}
+
 function ensureUI() {
   const mgrCls = ObjC.classes.UIManager;
   if (!mgrCls) { log('UI: UIManager absent'); return; }
@@ -164,29 +205,69 @@ function ensureUI() {
 
   let menu = call(mgr, 'menu', []);
   let tpp = call(mgr, 'tppButton', []);
-  log('UI: before menu=' + describe(menu) + ' tpp=' + describe(tpp));
+  log('UI: pass menu=' + describe(menu) + ' tpp=' + describe(tpp));
 
   if ((!menu || menu.isNull()) && (!tpp || tpp.isNull())) {
-    log('UI: menu missing -> forcing setupUI');
+    log('UI: tree missing -> setupUI');
     call(mgr, 'setupUI', []);
-    call(mgr, 'showTPPButton:', [1]);
     menu = call(mgr, 'menu', []);
     tpp = call(mgr, 'tppButton', []);
     log('UI: after setupUI menu=' + describe(menu) + ' tpp=' + describe(tpp));
   }
 
+  /* Also builds the button when setupUI produced nothing, and un-hides one. */
+  safe(() => mgr.showTPPButton_(1));
+  if (safe(() => mgr.respondsToSelector_(ObjC.selector('updateTPPButtonState:')), 0))
+    safe(() => mgr.updateTPPButtonState_(1));
+
+  menu = call(mgr, 'menu', []);
+  tpp = call(mgr, 'tppButton', []);
+  const esp = call(mgr, 'espOverlay', []);
+  const win = keyWindow();
+  log('UI: keyWindow=' + describe(win));
+  logView('UI: menu', menu);
+  logView('UI: tpp', tpp);
+  logView('UI: esp', esp);
+
   if (tpp && !tpp.isNull()) {
-    const win = safe(() => tpp.window(), null);
-    if (!win || win.isNull()) {
-      const keyWin = safe(() => ObjC.classes.UIApplication.sharedApplication()
-        .keyWindow(), null);
-      log('UI: tpp has no window, keyWindow=' + describe(keyWin));
-      if (keyWin && !keyWin.isNull()) safe(() => keyWin.addSubview_(tpp));
-    } else {
-      log('UI: tpp attached hidden=' + safe(() => tpp.hidden(), '?') +
-          ' alpha=' + safe(() => tpp.alpha(), '?'));
-    }
+    attachToWindow(tpp, win, false);
+    safe(() => tpp.setHidden_(0));
+    safe(() => tpp.setAlpha_(1));
+    safe(() => tpp.setUserInteractionEnabled_(1));
   }
+  if (menu && !menu.isNull()) attachToWindow(menu, win, true);
+  if (esp && !esp.isNull()) attachToWindow(esp, win, true);
+}
+
+/* The three blocks the host registers through the C API
+ * (apiclient_on_check_package / on_check_device / on_login). This is the exact
+ * tail of -[SKClient handleResponse:error:]: package(token), device(device,
+ * token), login(). Skipping any of them leaves the host's own post-login code —
+ * the part that builds and enables its menu — never called. */
+function fireCallbacks(client) {
+  let token = call(client, 'sessionToken', []);
+  if (!token || token.isNull()) token = ObjC.classes.NSString.stringWithString_('qos.token.synthetic');
+  let device = call(client, 'devicePayload', []);
+  if (!device || device.isNull()) device = ObjC.classes.NSDictionary.dictionary();
+
+  const pkg = call(client, 'onCheckPackage', []);
+  log('CALLBACK onCheckPackage=' + (pkg && !pkg.isNull() ? 'set' : 'nil'));
+  if (pkg && !pkg.isNull()) safe(() => new ObjC.Block(pkg).implementation(token));
+
+  const dev = call(client, 'onCheckDevice', []);
+  log('CALLBACK onCheckDevice=' + (dev && !dev.isNull() ? 'set' : 'nil'));
+  if (dev && !dev.isNull()) safe(() => new ObjC.Block(dev).implementation(device, token));
+
+  const login = call(client, 'onLoginSuccess', []);
+  log('CALLBACK onLoginSuccess=' + (login && !login.isNull() ? 'set' : 'nil'));
+  if (login && !login.isNull()) safe(() => new ObjC.Block(login).implementation());
+}
+
+/* Nothing in PxExtFFi calls +[UIManager shared], so the framework tree only
+ * appears if forced. A grant can land before the key window exists, so run a
+ * handful of passes instead of guessing one moment. */
+function ensureUILater() {
+  [500, 1500, 3000, 6000, 10000].forEach(ms => setTimeout(() => safe(() => ensureUI()), ms));
 }
 
 function grant(client) {
@@ -194,21 +275,24 @@ function grant(client) {
   log('GRANT begin');
   dumpState(client);
   applyState(client);
+
+  // Callback order follows the framework: host builds its UI from these, then
+  // pending blocks run.
+  fireCallbacks(client);
   call(client, 'runPendingBlocks', []);
 
   const hud = call(client, 'hud', []);
   call(hud, 'hideLoading', []);
   call(hud, 'hideBlockingWait', []);
 
-  ensureUI();
+  ensureUILater();
 
-  const cb = call(client, 'onLoginSuccess', []);
-  if (cb && !cb.isNull()) {
-    log('GRANT firing onLoginSuccess');
-    safe(() => new ObjC.Block(cb).implementation());
-  } else {
-    log('GRANT no onLoginSuccess callback');
-  }
+  // A prompt left up keeps SKHUD's shield in the host view, which covers the
+  // menu and eats touches.
+  call(hud, 'dismissAll', []);
+  call(hud, 'dropShieldIfIdle', []);
+  log('GRANT overlay cleared visible=' + safe(() => hud.hasVisibleHUD(), '?'));
+
   log('GRANT done');
   dumpState(client);
 }
@@ -325,12 +409,27 @@ function install() {
     return 0;
   });
 
-  /* Teardown removes the menu tree. The env scanner and the revocation tick
-   * both route here; a menu that vanishes seconds after appearing is the
-   * visible symptom. */
+  /* Observation only: these answer "who builds the menu, and does the framework
+   * ever reach it on its own". */
   const UIManager = ObjC.classes.UIManager;
   if (UIManager) {
     hook(UIManager, '-', 'teardownUI', function () { log('teardownUI blocked'); });
+    hook(UIManager, '-', 'setupUI', function (self, orig) {
+      log('HOOK -setupUI enter');
+      safe(() => orig());
+      logView('HOOK setupUI menu', call(self, 'menu', []));
+      logView('HOOK setupUI tpp', call(self, 'tppButton', []));
+    });
+    hook(UIManager, '-', 'showTPPButton:', function (self, orig, on) {
+      log('HOOK -showTPPButton:' + on);
+      safe(() => orig());
+      logView('HOOK showTPP tpp', call(self, 'tppButton', []));
+    });
+    hook(UIManager, '-', 'toggleMenu', function (self, orig) {
+      log('HOOK -toggleMenu');
+      safe(() => orig());
+      logView('HOOK toggleMenu menu', call(self, 'menu', []));
+    });
   }
 
   hook(SKClient, '-', 'fail:code:silent:', function (self, orig, a, code, silent) {

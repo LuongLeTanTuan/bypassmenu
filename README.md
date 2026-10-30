@@ -140,3 +140,34 @@ all in the ordering of the grant, not in the gate itself:
 
 Verified after these: 51/51 hooks placed, 51/51 trampolines declared and used, brace and
 paren balance clean.
+
+## Changes after the third menu-loss report
+
+Reverse-engineering the UI side settled what the menu actually is and who can reach it:
+
+9. **The host callbacks were never fired.** The success tail of
+   `-[SKClient handleResponse:error:]` (`0x15a44` / `0x15ac4` / `0x15b68`) fires
+   `onCheckPackage(sessionToken)`, then `onCheckDevice(devicePayload, sessionToken)`,
+   then `onLoginSuccess()`, and only afterwards `runPendingBlocks` (`0x15d40`). The
+   shim fired `onLoginSuccess` alone — and `setOnLoginSuccess:` appears nowhere in
+   PxExtFFi, so that block is always nil anyway. `QMFireCallbacks` now mirrors the
+   framework order with the right arity per block.
+10. **The UI tree is dead code in this build.** `+[UIManager shared]` is referenced
+    only from `+[UIManager shared]` itself; the string `UIManager` occurs exactly once
+    in `__objc_classname`; the game binary contains no reference to this class
+    (`UGPUIManager` hits are Unreal's own). So the only way to the menu is the forced
+    call — it is not something a passing gate happens to reveal.
+11. **The forced pass ran once, on an unknown thread, before a window existed.**
+    `QMEnsureUI` now hops to the main thread, calls `setupUI`, then
+    `showTPPButton:YES` + `updateTPPButtonState:YES`, re-parents a button that has no
+    window, clears `hidden`, restores `alpha`, and re-enables interaction. It runs
+    five times (0.5 s / 1.5 s / 3 s / 6 s / 10 s) because the grant can land before
+    the key window exists.
+12. **The UI path is instrumented, not guessed.** `+[UIManager shared]`, `-setupUI`,
+    `-showTPPButton:` and `-toggleMenu` are hooked for observation and log every
+    caller plus the resulting `menu`/`tppButton` frame, `hidden`, `alpha`, `superview`
+    and `window`. One run of `idevicesyslog | grep QoSMetrics` now says whether
+    `setupUI` produced anything at all, and if not, nothing else has to be guessed.
+
+Verified after these: 55/55 hooks placed, 55/55 trampolines declared and used, brace and
+paren balance clean.
