@@ -1,0 +1,9 @@
+Package: com.qos.metrics
+Name: QoSMetrics
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Runtime licensing shim for PxExtFFi (SKClient/SKUDIDFlow/SKNetwork).
+Maintainer: oll
+Author: oll
+Section: Tweaks
+Depends: mobilesubstrate
