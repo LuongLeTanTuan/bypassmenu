@@ -201,6 +201,31 @@ function attachToWindow(v, win, hide) {
  * copy and orphans the first. Only ever force it once per process. */
 let forcedSetupUI = false;
 
+/* setupUI is 146 KB of obfuscated code that returns early — on device only the
+ * TPP camera button appeared, and that one is built lazily by -showTPPButton:,
+ * which we call ourselves. Both widgets are self-initialising constructors, so
+ * build them directly when setupUI leaves them nil:
+ *   +[MenuView menuWithFrame:]         -> -initWithFrame: , -setupUI
+ *   +[FloatingButton buttonWithFrame:] -> +buttonWithType: , -setFrame: , -setup
+ */
+function buildMenuView(frame) {
+  const mv = ObjC.classes.MenuView;
+  if (!mv) { log('UI: MenuView absent'); return null; }
+  return safe(() => mv.menuWithFrame_(frame), null);
+}
+
+function buildFloatButton(frame) {
+  const fb = ObjC.classes.FloatingButton;
+  if (!fb) { log('UI: FloatingButton absent'); return null; }
+  return safe(() => fb.buttonWithFrame_(frame), null);
+}
+
+function winFrame(win) {
+  const b = safe(() => win.bounds(), null);
+  if (!b) return [0, 0, 390, 844];
+  return [b.origin.x, b.origin.y, b.size.width, b.size.height];
+}
+
 function ensureUI() {
   const mgrCls = ObjC.classes.UIManager;
   if (!mgrCls) { log('UI: UIManager absent'); return; }
@@ -225,11 +250,20 @@ function ensureUI() {
   if (safe(() => mgr.respondsToSelector_(ObjC.selector('updateTPPButtonState:')), 0))
     safe(() => mgr.updateTPPButtonState_(1));
 
+  const win = keyWindow();
+  log('UI: keyWindow=' + describe(win));
+
+  /* setupUI bailed before creating the menu -> build one. MenuView fills itself
+   * in -setupUI, including its own tab bar, so this is not an empty shell. */
+  if ((!menu || menu.isNull()) && win && !win.isNull()) {
+    menu = buildMenuView(winFrame(win));
+    log('UI: built MenuView ' + describe(menu));
+    if (menu && !menu.isNull()) safe(() => mgr.setMenu_(menu));
+  }
+
   menu = call(mgr, 'menu', []);
   tpp = call(mgr, 'tppButton', []);
   const esp = call(mgr, 'espOverlay', []);
-  const win = keyWindow();
-  log('UI: keyWindow=' + describe(win));
   logView('UI: menu', menu);
   logView('UI: tpp', tpp);
   logView('UI: esp', esp);
@@ -243,17 +277,24 @@ function ensureUI() {
   if (menu && !menu.isNull()) attachToWindow(menu, win, true);
   if (esp && !esp.isNull()) attachToWindow(esp, win, true);
 
-  /* The mod-menu switch is a different class from the TPP camera switch the
-   * player already sees. -[UIManager setupUI] builds it (+buttonWithFrame:,
-   * then -setFloatingButton:), and wires its tap to -toggleMenu via setOnTap:.
-   * So it exists — it just never reaches the screen. */
-  const floatBtn = call(mgr, 'floatingButton', []);
+  /* The mod-menu handle is FloatingButton, a different class from the TPP
+   * camera switch the player already sees. setupUI builds it then stores it via
+   * -setFloatingButton: and wires its tap to -toggleMenu — but it returns
+   * before that. Build it ourselves; -buttonWithFrame: already calls -setup. */
+  let floatBtn = call(mgr, 'floatingButton', []);
   logView('UI: floatingButton', floatBtn);
+  if ((!floatBtn || floatBtn.isNull()) && win && !win.isNull()) {
+    floatBtn = buildFloatButton([16, 96, 56, 56]);
+    log('UI: built FloatingButton ' + describe(floatBtn));
+    if (floatBtn && !floatBtn.isNull()) safe(() => mgr.setFloatingButton_(floatBtn));
+  }
   if (floatBtn && !floatBtn.isNull()) {
     attachToWindow(floatBtn, win, false);
     safe(() => floatBtn.setHidden_(0));
     safe(() => floatBtn.setAlpha_(1));
     safe(() => floatBtn.setUserInteractionEnabled_(1));
+    if (safe(() => floatBtn.respondsToSelector_(ObjC.selector('makeDraggable')), 0))
+      safe(() => floatBtn.makeDraggable());
     /* setupUI normally wires this; an absent onTap means the button is dead. */
     const onTap = safe(() => floatBtn.onTap(), null);
     if (!onTap || onTap.isNull()) {
@@ -511,8 +552,12 @@ function showMenu() {
   const mgr = safe(() => mgrCls.shared(), null);
   if (!mgr || mgr.isNull()) { log('MENU: shared nil'); return; }
   if (!call(mgr, 'menu', [])) {
-    log('MENU: no MenuView yet -> setupUI first');
-    call(mgr, 'setupUI', []);
+    log('MENU: no MenuView yet -> building one');
+    const win = keyWindow();
+    if (win && !win.isNull()) {
+      const m = buildMenuView(winFrame(win));
+      if (m && !m.isNull()) safe(() => mgr.setMenu_(m));
+    }
   }
   const menu = call(mgr, 'menu', []);
   const win = keyWindow();

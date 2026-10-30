@@ -197,3 +197,27 @@ button there. That is exactly what was reported.
     as the `qosmenu()` REPL helper, so the menu can be opened with no button at all.
 
 Verified after these: 55/55 hooks placed, brace and paren balance clean.
+
+## Changes after "vẫn không thấy icon"
+
+The forced `setupUI` never got far enough. What proved it: `-[UIManager showTPPButton:]`
+contains two `TPPFloatingButton` class references and builds the button lazily, so the
+TPP switch the player saw came from **our own** `showTPPButton:YES` call — not from
+`setupUI`. `FloatingButton` appears once in `setupUI`, at `+0x4478`, and that line was
+never reached. `setupUI` is 146 KB of obfuscated code and returns early somewhere before
+it. Fighting that function is a dead end, so the tweak stops depending on it.
+
+Both widgets are self-initialising constructors, verified in the disassembly:
+
+- `+[MenuView menuWithFrame:]` → `initWithFrame:` then `-setupUI` (`0x1cb75c`, `0x1cbccc`)
+- `+[FloatingButton buttonWithFrame:]` → `buttonWithType:` `setFrame:` `-setup` (`0x5a784`, `0x5a7b0`, `0x5b0ac`)
+
+15. **The menu and its button are now built directly** when `setupUI` leaves them nil:
+    `MenuView.menuWithFrame:` + `-[UIManager setMenu:]`, and
+    `FloatingButton.buttonWithFrame:` + `-setOnTap:` → `toggleMenu` +
+    `-[UIManager setFloatingButton:]`, then attached, un-hidden, `makeDraggable`.
+16. **A two-finger tap opens the menu**, installed once on the key window by
+    `QMInstallMenuGesture`. It uses `UIWindow addGestureRecognizer:` with
+    `cancelsTouchesInView = NO`, so the game keeps every touch and the mod needs no icon
+    at all. This is the guaranteed entry point — it depends on nothing in the framework
+    except `-[UIManager toggleMenu]`, which does its own `addSubview:`.

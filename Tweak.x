@@ -123,6 +123,37 @@ static UIWindow *QMKeyWindow(void) {
     return w;
 }
 
+static void QMShowMenu(void);
+
+// Guaranteed way into the menu that does not depend on any framework widget:
+// a two-finger tap on the key window. cancelsTouchesInView is left off so the
+// game still receives every touch as usual.
+@interface QMTapTarget : NSObject
+- (void)qmHandleTap:(UITapGestureRecognizer *)g;
+@end
+
+@implementation QMTapTarget
+- (void)qmHandleTap:(UITapGestureRecognizer *)g {
+    QMDiagLog(@"GESTURE two-finger tap -> toggle menu");
+    QMShowMenu();
+}
+@end
+
+static QMTapTarget *gTapTarget = nil;
+
+static void QMInstallMenuGesture(UIWindow *win) {
+    if (!win || gTapTarget) return;
+    gTapTarget = [[QMTapTarget alloc] init];
+    UITapGestureRecognizer *g =
+        [[UITapGestureRecognizer alloc] initWithTarget:gTapTarget
+                                                action:@selector(qmHandleTap:)];
+    g.numberOfTouchesRequired = 2;
+    g.numberOfTapsRequired = 1;
+    g.cancelsTouchesInView = NO;
+    [win addGestureRecognizer:g];
+    QMDiagLog(@"UI: two-finger tap installed on window %p", (__bridge void *)win);
+}
+
 static void QMLogView(NSString *label, id view) {
     if (!view || ![view isKindOfClass:[UIView class]]) {
         QMDiagLog(@"%@ = %p (not a view)", label, (__bridge void *)view);
@@ -147,12 +178,30 @@ static void QMAttachToWindow(id view, UIWindow *win, BOOL hideUnlessShown) {
     QMDiagLog(@"UI: attached %s to key window", class_getName([v class]));
 }
 
-// The menu and the floating button are built by -[UIManager setupUI]. Nothing
-// inside PxExtFFi ever calls +[UIManager shared] (verified: the class is
-// referenced only from its own methods, and the string "UIManager" appears
-// exactly once in __objc_classname), so the whole tree is dead code unless it
-// is forced. Nothing outside the framework calls it either — the game binary
-// contains no reference to this UIManager class at all.
+// -[UIManager setupUI] is 146 KB of obfuscated code and returns early: on device
+// only the TPP camera button came up, and that button is built lazily by
+// -showTPPButton:, which we call ourselves — so setupUI never reached its
+// +0x4478 (+[FloatingButton buttonWithFrame:]) / +0x449c (-setFloatingButton:)
+// block at all. Both widgets we want are self-initialising constructors, so
+// build them directly when setupUI leaves them nil:
+//   +[MenuView menuWithFrame:]         -> -initWithFrame: , -setupUI
+//   +[FloatingButton buttonWithFrame:] -> +buttonWithType: , -setFrame: , -setup
+static id QMMenuViewNew(CGRect frame) {
+    Class mv = NSClassFromString(@"MenuView");
+    if (!mv || ![mv respondsToSelector:@selector(menuWithFrame:)]) return nil;
+    id (*fn)(id, SEL, CGRect) =
+        (id (*)(id, SEL, CGRect))[(id)mv methodForSelector:@selector(menuWithFrame:)];
+    return fn((id)mv, @selector(menuWithFrame:), frame);
+}
+
+static id QMFloatButtonNew(CGRect frame) {
+    Class fb = NSClassFromString(@"FloatingButton");
+    if (!fb || ![fb respondsToSelector:@selector(buttonWithFrame:)]) return nil;
+    id (*fn)(id, SEL, CGRect) =
+        (id (*)(id, SEL, CGRect))[(id)fb methodForSelector:@selector(buttonWithFrame:)];
+    return fn((id)fb, @selector(buttonWithFrame:), frame);
+}
+
 static void QMEnsureUI(void) {
     Class mgr = NSClassFromString(@"UIManager");
     if (!mgr) { QMDiagLog(@"UI: UIManager absent"); return; }
@@ -182,8 +231,20 @@ static void QMEnsureUI(void) {
         QMDiagLog(@"UI: after setupUI menu=%p tpp=%p", (__bridge void *)menu, (__bridge void *)tpp);
     }
 
-    // The button is also created here when setupUI produced nothing, and this
-    // is what un-hides an existing one.
+    UIWindow *win = QMKeyWindow();
+    QMDiagLog(@"UI: keyWindow=%p bounds=%@", (__bridge void *)win,
+              win ? NSStringFromCGRect(win.bounds) : @"(none)");
+    QMInstallMenuGesture(win);
+
+    // setupUI bailed before creating the menu -> build one. MenuView fills
+    // itself in -setupUI, including its own tab bar, so this is not a shell.
+    if (!menu && win) {
+        menu = QMMenuViewNew(win.bounds);
+        QMDiagLog(@"UI: built MenuView %p", (__bridge void *)menu);
+        if (menu) QMSendO(shared, @selector(setMenu:), menu);
+    }
+
+    // The button is created lazily here, and this is what un-hides an existing one.
     QMSendB(shared, @selector(showTPPButton:), YES);
     if ([shared respondsToSelector:@selector(updateTPPButtonState:)])
         QMSendB(shared, @selector(updateTPPButtonState:), YES);
@@ -192,15 +253,11 @@ static void QMEnsureUI(void) {
     tpp = QMSend0(shared, @selector(tppButton));
     id esp = QMSend0(shared, @selector(espOverlay));
 
-    UIWindow *win = QMKeyWindow();
-    QMDiagLog(@"UI: keyWindow=%p", (__bridge void *)win);
-
     QMLogView(@"UI: menu", menu);
     QMLogView(@"UI: tpp", tpp);
     QMLogView(@"UI: esp", esp);
 
-    // The floating button is the handle the player opens the menu with, so it
-    // must be on screen and interactive.
+    // The TPP switch is a floating view too; it must be on screen to be tapped.
     if ([tpp isKindOfClass:[UIView class]]) {
         UIView *v = (UIView *)tpp;
         QMAttachToWindow(v, win, NO);
@@ -216,13 +273,18 @@ static void QMEnsureUI(void) {
     if ([menu isKindOfClass:[UIView class]]) QMAttachToWindow(menu, win, YES);
     if ([esp isKindOfClass:[UIView class]]) QMAttachToWindow(esp, win, YES);
 
-    // The mod-menu switch is a different class from the TPP camera switch the
-    // player already sees. -[UIManager setupUI] builds it at +0x4478
-    // (+[FloatingButton buttonWithFrame:]), stores it at +0x449c
-    // (-setFloatingButton:), and wires its tap to -toggleMenu at +0x9040
-    // (-setOnTap:) / +0x203ec. So it exists — it just never reaches the screen.
+    // The mod-menu handle is FloatingButton, a different class from the TPP
+    // camera switch the player already sees. setupUI builds it at +0x4478
+    // (+buttonWithFrame:), stores it at +0x449c (-setFloatingButton:) and wires
+    // its tap to -toggleMenu (+0x9040 -setOnTap:, +0x203ec -toggleMenu) — but it
+    // never got there. Build it ourselves; -buttonWithFrame: already calls -setup.
     id floatBtn = QMSend0(shared, @selector(floatingButton));
     QMLogView(@"UI: floatingButton", floatBtn);
+    if (!floatBtn && win) {
+        floatBtn = QMFloatButtonNew(CGRectMake(16.0, 96.0, 56.0, 56.0));
+        QMDiagLog(@"UI: built FloatingButton %p", (__bridge void *)floatBtn);
+        if (floatBtn) QMSendO(shared, @selector(setFloatingButton:), floatBtn);
+    }
     if ([floatBtn isKindOfClass:[UIView class]]) {
         UIView *v = (UIView *)floatBtn;
         QMAttachToWindow(v, win, NO);
@@ -231,6 +293,8 @@ static void QMEnsureUI(void) {
         v.userInteractionEnabled = YES;
         if (CGRectIsEmpty(v.frame) && win)
             v.frame = CGRectMake(16.0, 96.0, 56.0, 56.0);
+        if ([floatBtn respondsToSelector:@selector(makeDraggable)])
+            QMSendV(floatBtn, @selector(makeDraggable));
 
         // setupUI normally wires this; a nil onTap means the button is dead.
         if ([floatBtn respondsToSelector:@selector(onTap)] &&
@@ -262,8 +326,12 @@ static void QMShowMenu(void) {
     }
 
     if (!QMSend0(shared, @selector(menu))) {
-        QMDiagLog(@"MENU: no MenuView yet -> setupUI first");
-        QMSendV(shared, @selector(setupUI));
+        QMDiagLog(@"MENU: no MenuView yet -> building one");
+        UIWindow *w = QMKeyWindow();
+        if (w) {
+            id m = QMMenuViewNew(w.bounds);
+            if (m) QMSendO(shared, @selector(setMenu:), m);
+        }
     }
     id menu = QMSend0(shared, @selector(menu));
     if ([menu isKindOfClass:[UIView class]]) {
